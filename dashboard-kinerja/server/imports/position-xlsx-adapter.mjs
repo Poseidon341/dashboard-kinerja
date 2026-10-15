@@ -167,14 +167,21 @@ async function writeChunk(stream, text) {
   if (!stream.write(text)) await once(stream, 'drain');
 }
 
-export async function materializePositionWorkbook(filePath, { limit = 0, powershell = 'powershell.exe' } = {}) {
+export async function materializePositionWorkbook(filePath, {
+  limit = 0, powershell = 'powershell.exe', maxRows = 2_000_000,
+  maxMaterializedBytes = 800 * 1024 * 1024,
+} = {}) {
   if (!Number.isSafeInteger(limit) || limit < 0) throw new Error('Limit XLSX harus bilangan bulat nonnegatif.');
+  if (!Number.isSafeInteger(maxRows) || maxRows < 1 || !Number.isSafeInteger(maxMaterializedBytes) || maxMaterializedBytes < 1) {
+    throw new Error('Batas ukuran materialisasi XLSX tidak valid.');
+  }
   const sourcePath = resolve(filePath);
   const [sourceInfo, checksum] = await Promise.all([stat(sourcePath), checksumFile(sourcePath)]);
   const directory = await mkdtemp(join(tmpdir(), 'dashboard-position-xlsx-'));
   const tempPath = join(directory, 'position-rows.tmp');
   const output = createWriteStream(tempPath, { encoding: 'utf8' });
   let rowCount = 0;
+  let materializedBytes = 2;
   let writtenRows = 0;
   const rowBatch = [];
   let failed = false;
@@ -192,6 +199,8 @@ export async function materializePositionWorkbook(filePath, { limit = 0, powersh
     await writeChunk(output, '[');
     for await (const line of lines) {
       if (!line) continue;
+      materializedBytes += Buffer.byteLength(line, 'utf8') + (rowCount ? 1 : 0);
+      if (rowCount >= maxRows || materializedBytes > maxMaterializedBytes) throw new Error('Sheet segmen_data melebihi batas aman pemrosesan.');
       rowBatch.push(line);
       rowCount += 1;
       if (rowBatch.length >= 1000) {

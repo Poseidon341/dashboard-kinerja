@@ -1,0 +1,23 @@
+[Unit]
+Description=Dashboard Funding MySQL API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dashboardfunding
+Group=dashboardfunding
+WorkingDirectory=/opt/dashboard-funding/current
+EnvironmentFile=/etc/dashboard-funding/backend.env
+ExecStart=/usr/bin/node /opt/dashboard-funding/current/server/shadow.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadOnlyPaths=/opt/dashboard-funding/current
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

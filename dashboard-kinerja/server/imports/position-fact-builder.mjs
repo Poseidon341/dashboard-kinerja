@@ -49,6 +49,17 @@ export function factFromStaging(row) {
 }
 
 export function compareFactRows(existing, expected) {
+  const normalized = (field, value) => {
+    if (value == null) return null;
+    if (field === 'position_date' && value instanceof Date) {
+      return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+    }
+    if (field === 'balance') {
+      const text = String(value);
+      return text.includes('.') ? text.replace(/0+$/, '').replace(/\.$/, '') : text;
+    }
+    return String(value);
+  };
   const fields = [
     'batch_id', 'object_id', 'source_row_number', 'position_date', 'office_id', 'segment_id', 'product_id',
     'source_segment_label', 'source_product_label', 'source_branch_label', 'source_office_label',
@@ -56,8 +67,8 @@ export function compareFactRows(existing, expected) {
     'parse_status', 'mapping_status',
   ];
   return fields.every((field) => {
-    const left = existing[field] == null ? null : String(existing[field]);
-    const right = expected[field] == null ? null : String(expected[field]);
+    const left = normalized(field, existing[field]);
+    const right = normalized(field, expected[field]);
     return left === right;
   });
 }

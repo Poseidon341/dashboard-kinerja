@@ -2,6 +2,8 @@ import http from 'node:http';
 import { getDatabaseConfig, getDatabasePool } from './db.js';
 import { createFundingPositionHandler } from './funding-position-api.mjs';
 import { createFundingReferenceHandler } from './funding-reference-api.mjs';
+import { createAdminUploadHandler } from './admin-upload-api.mjs';
+import { resolveRuntimeTarget, assertActualRuntimeTarget, RuntimeTargetError } from './runtime-target.mjs';
 
 export const SHADOW_TARGET = Object.freeze({ host: '127.0.0.1', port: 3308, database: 'dashboard_funding_test' });
 
@@ -17,25 +19,20 @@ const REQUIRED_COLUMNS = Object.freeze({
 
 export class ShadowTargetError extends Error {
   constructor(code = 'SHADOW_TARGET_NOT_ALLOWED') {
-    super('Shadow API hanya tersedia untuk database pengujian lokal yang diizinkan.');
+    super('Shadow API hanya tersedia untuk target database runtime yang diizinkan.');
     this.name = 'ShadowTargetError';
     this.code = code;
   }
 }
 
-export function assertShadowTarget(config) {
-  const isLoopback = ['127.0.0.1', 'localhost'].includes(String(config?.host || '').trim().toLowerCase());
-  if (!isLoopback || Number(config?.port) !== SHADOW_TARGET.port || config?.database !== SHADOW_TARGET.database) {
-    throw new ShadowTargetError();
-  }
+export function assertShadowTarget(config, env = process.env) {
+  try { return resolveRuntimeTarget(config, env); }
+  catch { throw new ShadowTargetError(); }
 }
 
-async function assertActualDatabase(connection) {
-  const [rows] = await connection.execute('SELECT DATABASE() AS database_name, @@port AS server_port');
-  const active = rows?.[0];
-  if (active?.database_name !== SHADOW_TARGET.database || Number(active?.server_port) !== SHADOW_TARGET.port) {
-    throw new ShadowTargetError('SHADOW_ACTIVE_DATABASE_MISMATCH');
-  }
+async function assertActualDatabase(connection, config, env) {
+  try { await assertActualRuntimeTarget(connection, config, env); }
+  catch (error) { if (error instanceof RuntimeTargetError) throw new ShadowTargetError('SHADOW_ACTIVE_DATABASE_MISMATCH'); throw error; }
 }
 
 async function verifySchema(connection) {
@@ -62,12 +59,12 @@ async function verifySchema(connection) {
   }
 }
 
-async function withReadConnection({ getConfig, getPool }, callback) {
+async function withReadConnection({ getConfig, getPool, env = process.env }, callback) {
   const config = getConfig();
-  assertShadowTarget(config);
+  assertShadowTarget(config, env);
   const connection = await getPool().getConnection();
   try {
-    await assertActualDatabase(connection);
+    await assertActualDatabase(connection, config, env);
     await verifySchema(connection);
     return await callback(connection);
   } finally {
@@ -197,13 +194,17 @@ function sendJson(response, status, body) {
 }
 
 export function createShadowRequestHandler(dependencies = {}) {
+  const adminHandler = createAdminUploadHandler(dependencies);
   const fundingHandler = createFundingPositionHandler(dependencies);
   const referenceHandler = createFundingReferenceHandler(dependencies);
   const deps = {
     getConfig: dependencies.getConfig || getDatabaseConfig,
     getPool: dependencies.getPool || getDatabasePool,
+    env: dependencies.env || process.env,
   };
   return async function handleShadowRequest(request, response) {
+    const adminHandled = await adminHandler(request, response);
+    if (adminHandled !== false) return;
     const fundingHandled = await fundingHandler(request, response);
     if (fundingHandled !== false) return;
     const referenceHandled = await referenceHandler(request, response);

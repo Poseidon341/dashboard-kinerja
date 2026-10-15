@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import mysql from 'mysql2/promise';
@@ -56,8 +56,25 @@ export function getDatabaseConfig(env = process.env) {
     throw error;
   }
 
+  const host = String(env.MYSQL_HOST).trim();
+  let ssl;
+  if (env.MYSQL_SSL_CA_FILE) {
+    try { ssl = { ca: readFileSync(String(env.MYSQL_SSL_CA_FILE)), rejectUnauthorized: true }; }
+    catch {
+      const error = new DatabaseConfigurationError([]);
+      error.code = 'INVALID_MYSQL_SSL_CA_FILE';
+      throw error;
+    }
+  }
+  if (env.DASHBOARD_RUNTIME_ENV === 'production'
+    && !['127.0.0.1', 'localhost'].includes(host.toLowerCase()) && !ssl) {
+    const error = new DatabaseConfigurationError([]);
+    error.code = 'MYSQL_TLS_REQUIRED';
+    throw error;
+  }
+
   return {
-    host: String(env.MYSQL_HOST).trim(),
+    host,
     port,
     database: String(env.MYSQL_DATABASE).trim(),
     user: String(env.MYSQL_USER),
@@ -71,6 +88,7 @@ export function getDatabaseConfig(env = process.env) {
     bigNumberStrings: true,
     decimalNumbers: false,
     multipleStatements: false,
+    ...(ssl ? { ssl } : {}),
   };
 }
 

@@ -1,5 +1,6 @@
 import { getDatabaseConfig, getDatabasePool } from './db.js';
 import { assertFundingApiTarget, FundingApiTargetError } from './funding-position-api.mjs';
+import { assertActualRuntimeTarget, RuntimeTargetError } from './runtime-target.mjs';
 
 const REQUIRED = Object.freeze({
   dashboard_domain_publication: ['domain_key', 'scope_key', 'batch_id'],
@@ -29,9 +30,9 @@ const RMFT_SNAPSHOT_SQL = `
   JOIN dashboard_import_object o ON o.object_id=oi.object_id
   WHERE p.domain_key='rmft_master' AND p.scope_key='default' LIMIT 1`;
 
-async function verifyActualTarget(connection) {
-  const [rows] = await connection.execute('SELECT DATABASE() AS database_name,@@port AS server_port');
-  if (rows?.[0]?.database_name !== 'dashboard_funding_test' || Number(rows?.[0]?.server_port) !== 3308) throw new FundingApiTargetError();
+async function verifyActualTarget(connection, config, env) {
+  try { await assertActualRuntimeTarget(connection, config, env); }
+  catch (error) { if (error instanceof RuntimeTargetError) throw new FundingApiTargetError(); throw error; }
 }
 
 async function verifySchema(connection) {
@@ -149,6 +150,7 @@ function json(response, status, body) {
 export function createFundingReferenceHandler(dependencies = {}) {
   const getConfig = dependencies.getConfig || getDatabaseConfig;
   const getPool = dependencies.getPool || getDatabasePool;
+  const env = dependencies.env || process.env;
   return async (request, response) => {
     const url = new URL(request.url || '/', 'http://127.0.0.1');
     const paths = ['/api/funding/master/offices', '/api/funding/master/rmft', '/api/funding/rka', '/api/funding/prognosis', '/api/appraisal/sources', '/api/appraisal/data'];
@@ -156,9 +158,10 @@ export function createFundingReferenceHandler(dependencies = {}) {
     if (request.method !== 'GET') { json(response, 405, { status: 'error', error: 'method_not_allowed' }); return true; }
     let connection;
     try {
-      assertFundingApiTarget(getConfig());
+      const config = getConfig();
+      assertFundingApiTarget(config, env);
       connection = await getPool().getConnection();
-      await verifyActualTarget(connection);
+      await verifyActualTarget(connection, config, env);
       await verifySchema(connection);
       let payload;
       if (url.pathname === '/api/funding/master/offices') {

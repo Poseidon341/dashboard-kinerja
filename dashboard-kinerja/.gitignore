@@ -1,0 +1,77 @@
+# Dependencies and generated frontend output
+node_modules/
+dist/
+dist-ssr/
+coverage/
+
+# Local datasets, source snapshots and import workbooks
+data/source-archive/
+data/import/
+public/*.json
+public/*.csv
+**/*.xlsx
+**/*.xls
+**/*.xlsm
+**/*.csv
+**/*.jsonl
+**/*.ndjson
+**/*.parquet
+reports/
+
+# Database exports and local archives (migration source remains versioned)
+*.sql
+!server/migrations/*.sql
+*.dump
+*.db
+*.sqlite
+*.sqlite3
+*.ibd
+*.zip
+*.7z
+*.tar
+*.gz
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+!.env.production.example
+**/*service-account*.json
+**/*service_account*.json
+**/application_default_credentials.json
+**/credentials.json
+.secrets/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs, temporary output and local backups
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.bak
+*.backup
+*.old
+*.orig
+*.tmp
+*.temp
+*.swp
+*~
+
+# Editor and operating system files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

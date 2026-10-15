@@ -8,7 +8,7 @@ Backend memakai `mysql2` versi Promise API untuk connection pool dan prepared st
 
 ## Konfigurasi lokal
 
-1. Salin `.env.example` menjadi `.env` lokal. Template sudah memakai `MYSQL_HOST=127.0.0.1`, `MYSQL_PORT=3308`, dan `MYSQL_DATABASE=dashboard_funding`. File `.env` telah dicakup oleh `.gitignore`.
+1. Salin `.env.example` menjadi `.env` lokal. Template development memakai `MYSQL_HOST=127.0.0.1`, `MYSQL_PORT=3308`, dan `MYSQL_DATABASE=dashboard_funding_test`. File `.env` telah dicakup oleh `.gitignore`. Untuk server Ubuntu gunakan `.env.production.example` dan [panduan deployment](ubuntu-deployment.md).
 2. Isi `MYSQL_USER` dan `MYSQL_PASSWORD` secara lokal sesuai akun yang diberikan administrator MySQL. Jangan kirim nilainya melalui chat atau menambahkannya ke repository.
 3. `MYSQL_PASSWORD` boleh kosong hanya jika administrator memang mengonfirmasi akun tanpa password; variabel tetap harus didefinisikan.
 4. `MYSQL_CONNECTION_LIMIT` opsional, default 5, maksimum 50.

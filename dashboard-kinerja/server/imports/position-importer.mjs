@@ -93,7 +93,7 @@ export async function scanPositionFile(filePath, {
     segments: {}, products: {}, distinctOfficeLabels: 0, distinctBranchLabels: 0,
     sourceTypes: {}, numericValues: { accountCount: { blank: 0, null: 0, zero: 0, invalid: 0 }, balance: { blank: 0, null: 0, zero: 0, invalid: 0 } },
     numericFormats: { accountCount: {}, balance: {} }, numericStringShapes: { accountCount: {}, balance: {} }, fieldBlanks: {}, fieldNulls: {},
-    validationErrors: {}, expectedRows,
+    validationErrors: {}, expectedRows, periods: {},
   };
   const dates = new Set();
   const officeLabels = new Set();
@@ -274,6 +274,8 @@ export async function scanPositionFile(filePath, {
     else if (!positionDate) errors.push({ field: POSITION_KEYS.position, code: 'invalid_date' });
     if (positionDate) {
       dates.add(positionDate);
+      const period = positionDate.slice(0, 7);
+      totals.periods[period] = (totals.periods[period] ?? 0) + 1;
       if (!totals.dateMin || positionDate < totals.dateMin) totals.dateMin = positionDate;
       if (!totals.dateMax || positionDate > totals.dateMax) totals.dateMax = positionDate;
     }
@@ -422,7 +424,7 @@ function countStringShape(counter, value) {
 
 export async function importPositionFile(filePath, repository, {
   batchSize = 500, expectedRows = POSITION_EXPECTED_ROWS, strictSnapshot = true,
-  sourceChecksum = null, sourceSizeBytes = null, verifySourceUnchanged = null,
+  sourceChecksum = null, sourceSizeBytes = null, verifySourceUnchanged = null, sourceLocation = null,
 } = {}) {
   if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 2000) throw new Error('Ukuran chunk posisi harus 1 sampai 2000 baris.');
   const manifest = await scanPositionFile(filePath, { expectedRows, strictSnapshot, sourceChecksum, sourceSizeBytes });
@@ -430,7 +432,7 @@ export async function importPositionFile(filePath, repository, {
     const batch = await repository.reserveBatch({
       sourceKey: POSITION_SOURCE_KEY, sourceSystem: POSITION_SOURCE_SYSTEM, objectKey: POSITION_OBJECT_KEY,
       parserVersion: POSITION_PARSER_VERSION, checksum: manifest.checksum, sourceSizeBytes: manifest.sourceSizeBytes,
-      sourceRowCount: manifest.total, validationSummary: manifest,
+      sourceRowCount: manifest.total, validationSummary: manifest, sourceLocation,
     });
     if (batch.alreadyStaged) return { status: 'already_staged', batchId: batch.batchId, rows: manifest.total, checksum: manifest.checksum, summary: manifest };
     try {

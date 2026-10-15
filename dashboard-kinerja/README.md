@@ -4,7 +4,7 @@ Dashboard Funding adalah aplikasi React + Vite dengan backend Node.js. Pada konf
 
 ## Persyaratan
 
-- Node.js 22 atau lebih baru
+- Node.js 22.12+ atau 20.19+ (sesuai persyaratan Vite yang terpasang)
 - MySQL yang sudah berisi skema dan data Dashboard Funding
 - Port MySQL dan kredensial yang disediakan secara lokal oleh administrator
 
@@ -30,6 +30,8 @@ npm.cmd run db:health
 Perintah tersebut hanya memeriksa koneksi. Migrasi dan impor data tidak berjalan otomatis saat aplikasi dimulai.
 
 ## Menjalankan backend dan frontend
+
+Untuk production Ubuntu, gunakan [panduan deployment](docs/ubuntu-deployment.md), unit systemd, Nginx, dan Cloudflare Tunnel. Jangan memakai Vite development server atau `vite preview` sebagai server production.
 
 Buka dua terminal dari folder proyek.
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { assertFundingApiTarget, clearPositionRowsCacheForTests, createFundingPositionHandler, readPositionSummary } from '../server/funding-position-api.mjs';
+import { assertFundingApiTarget, buildSourceOfficeInventory, classifySourceOfficeType, clearPositionRowsCacheForTests, createFundingPositionHandler, readPositionSummary } from '../server/funding-position-api.mjs';
 
 const columns = {
   dashboard_source_registry: ['source_id', 'source_key'],
@@ -14,7 +14,7 @@ const columns = {
   dashboard_dim_office_version: ['office_id', 'office_type', 'office_name', 'area_name', 'source_object_id'],
 };
 
-function connectionFor({ sourceRows = 1_039_742, snapshotRows = 1_039_742, resolved = 1_038_051, unresolved = 1_691, invalidRows = 0 } = {}) {
+function connectionFor({ sourceRows = 1_039_742, snapshotRows = 1_039_742, resolved = 1_038_051, unresolved = 1_691, invalidRows = 0, publishedPeriod = null } = {}) {
   const statements = [];
   const connection = {
     statements,
@@ -24,12 +24,14 @@ function connectionFor({ sourceRows = 1_039_742, snapshotRows = 1_039_742, resol
       if (/information_schema\.COLUMNS/i.test(sql)) return [Object.entries(columns).flatMap(([TABLE_NAME, names]) => names.map(COLUMN_NAME => ({ TABLE_NAME, COLUMN_NAME })))];
       if (/FROM dashboard_source_registry s/i.test(sql)) return [[{ object_id: 4, source_checksum: 'a'.repeat(64), source_row_count: snapshotRows, batch_id: 'test-batch' }]];
       if (/COUNT\(\*\) AS fact_rows/i.test(sql)) throw new Error('API must not run a second full-fact validation scan');
+      if (/p\.domain_key='position_daily'/i.test(sql)) return [publishedPeriod ? [{ period: publishedPeriod, batch_id: 'new-batch', publication_version: 1, object_id: 8, source_checksum: 'b'.repeat(64) }] : []];
       if (/FROM dashboard_domain_publication p/i.test(sql)) return [[{ object_id: 1 }]];
+      if (/FROM dashboard_stg_position_row WHERE object_id/i.test(sql)) return [[{ total: 2 }]];
       if (/GROUP BY f\.position_date/i.test(sql)) return [[{
-        Posisi: '2026-10-04', 'Segmentasi BPR': 'MIKRO', Produk: 'TABUNGAN', 'Nama Cabang': 'KC BANYUWANGI',
+        Posisi: sql.includes('f.position_date>=?') ? `${publishedPeriod}-02` : '2026-10-04', 'Segmentasi BPR': 'MIKRO', Produk: 'TABUNGAN', 'Nama Cabang': 'KC BANYUWANGI',
         'Nama Uker': 'KC BANYUWANGI', 'Jumlah Rekening': '4', Saldo: '125.25', officeId: '11', mappingStatus: 'resolved',
-        officeType: 'KC', officeName: 'KC Banyuwangi', areaName: 'Area Jember', sourceRows,
-        resolvedRows: resolved, unresolvedRows: unresolved, inconsistentRows: 0, invalidRows,
+        officeType: 'KC', officeName: 'KC Banyuwangi', areaName: 'Area Jember', sourceRows: sql.includes('f.position_date>=?') ? 2 : sourceRows,
+        resolvedRows: sql.includes('f.position_date>=?') ? 2 : resolved, unresolvedRows: sql.includes('f.position_date>=?') ? 0 : unresolved, inconsistentRows: 0, invalidRows,
       }]];
       throw new Error(`Unexpected test query: ${sql}`);
     },
@@ -52,7 +54,37 @@ test('API hanya menerima database uji lokal port 3308', () => {
     { host: '127.0.0.1', port: 3308, database: 'dashboard_funding' },
     { host: 'db.example', port: 3308, database: 'dashboard_funding_test' },
     { host: 'localhost', port: 3307, database: 'dashboard_funding_test' },
-  ]) assert.throws(() => assertFundingApiTarget(config), /database pengujian lokal/);
+  ]) assert.throws(() => assertFundingApiTarget(config), /target database runtime/);
+});
+
+test('publikasi bulan baru menambah fakta tanpa menghilangkan snapshot lama', async () => {
+  clearPositionRowsCacheForTests();
+  const connection = connectionFor({ publishedPeriod: '2026-11' });
+  const handler = createFundingPositionHandler({
+    getConfig: () => ({ host: '127.0.0.1', port: 3308, database: 'dashboard_funding_test' }),
+    getPool: () => ({ getConnection: async () => connection }),
+  });
+  const response = responseCapture();
+  await handler(Object.assign(new EventEmitter(), { method: 'GET', url: '/api/funding/positions' }), response);
+  assert.equal(response.status, 200);
+  const payload = JSON.parse(response.body);
+  assert.equal(payload.recordCount, 1_039_744);
+  assert.deepEqual(payload.records.map(row => row.Posisi), ['2026-10-04', '2026-11-02']);
+});
+
+test('penggantian Oktober memilih hanya snapshot bulan baru dan tidak menghitung base dua kali', async () => {
+  clearPositionRowsCacheForTests();
+  const connection = connectionFor({ publishedPeriod: '2026-10' });
+  const handler = createFundingPositionHandler({
+    getConfig: () => ({ host: '127.0.0.1', port: 3308, database: 'dashboard_funding_test' }),
+    getPool: () => ({ getConnection: async () => connection }),
+  });
+  const response = responseCapture();
+  await handler(Object.assign(new EventEmitter(), { method: 'GET', url: '/api/funding/positions' }), response);
+  assert.equal(response.status, 200);
+  const payload = JSON.parse(response.body);
+  assert.equal(payload.recordCount, 2);
+  assert.deepEqual(payload.records.map(row => row.Posisi), ['2026-10-02']);
 });
 
 test('ringkasan menolak fakta yang belum lengkap atau unresolved yang hilang', async () => {
@@ -99,6 +131,10 @@ test('detail-unit memakai cache snapshot penuh dan menghasilkan subset Mikro-Tab
   const payload = JSON.parse(response.body);
   assert.equal(payload.aggregateRows, 1);
   assert.equal(payload.recordCount, 1_039_742);
+  assert.equal(payload.sourceOfficeInventory.length, 1);
+  assert.equal(payload.sourceOfficeInventory[0].sourceType, 'KC');
+  assert.equal(payload.sourceOfficeInventory[0].detailMetricGroups, 1);
+  assert.equal(Object.hasOwn(payload.sourceOfficeInventory[0], 'Saldo'), false);
   assert.match(response.headers['Server-Timing'], /cache;desc="hit"/);
   assert.equal(connection.statements.filter(sql => /GROUP BY f\.position_date/i.test(sql)).length, 1);
 
@@ -111,6 +147,32 @@ test('detail-unit memakai cache snapshot penuh dan menghasilkan subset Mikro-Tab
   await blocked(request, blockedResponse);
   assert.equal(blockedResponse.status, 403);
   assert.equal(opened, false);
+});
+
+test('klasifikasi sumber bertoken memisahkan KC, KCP, KK, UNIT dan tidak memakai substring di tengah nama', () => {
+  assert.equal(classifySourceOfficeType('KCP MUNCAR BANYUWANGI'), 'KCP');
+  assert.equal(classifySourceOfficeType('KK YAYASAN PUSPA DUNIA'), 'KK');
+  assert.equal(classifySourceOfficeType('KC BANYUWANGI'), 'KC');
+  assert.equal(classifySourceOfficeType('UNIT A. YANI MAGETAN'), 'UNIT');
+  assert.equal(classifySourceOfficeType('KANWIL MALANG'), null);
+  assert.equal(classifySourceOfficeType('CABANG KCP MALANG'), null);
+});
+
+test('inventaris sumber mengutamakan tipe pada label dan hanya merangkum ketersediaan metrik tanpa saldo', () => {
+  const inventory = buildSourceOfficeInventory([
+    { 'Nama Uker': 'KK YAYASAN PUSPA DUNIA', 'Nama Cabang': 'KC BANYUWANGI', officeId: '9', officeCode: '009', officeType: 'KC', 'Segmentasi BPR': 'RITEL', Produk: 'DEPOSITO', sourceRows: 1, Saldo: 2_690_475_780 },
+    { 'Nama Uker': 'KK YAYASAN PUSPA DUNIA', 'Nama Cabang': 'KC BANYUWANGI', officeId: '9', officeCode: '009', officeType: 'KC', 'Segmentasi BPR': 'MIKRO', Produk: 'TABUNGAN', sourceRows: 2, Saldo: 500 },
+    { 'Nama Uker': 'UNIT A. YANI MAGETAN', 'Nama Cabang': 'KC MAGETAN', officeId: null, officeCode: null, officeType: null, 'Segmentasi BPR': 'MIKRO', Produk: 'GIRO', sourceRows: 1, Saldo: 100 },
+  ]);
+  const kk = inventory.find((office) => office.sourceType === 'KK');
+  assert.equal(kk.masterType, 'KC');
+  assert.equal(kk.officeCode, '009');
+  assert.equal(kk.detailMetricGroups, 1);
+  assert.equal(kk.detailMetricSourceRows, 2);
+  assert.equal(Object.hasOwn(kk, 'Saldo'), false);
+  const unresolved = inventory.find((office) => office.officeLabel.startsWith('UNIT'));
+  assert.equal(unresolved.officeId, null);
+  assert.equal(unresolved.detailMetricGroups, 0);
 });
 
 test('permintaan awal bersamaan berbagi satu query agregasi', async () => {

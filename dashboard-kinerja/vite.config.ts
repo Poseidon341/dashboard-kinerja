@@ -15,6 +15,10 @@ export default defineConfig(({ mode }) => {
       target: `http://127.0.0.1:${shadowApiPort}`,
       changeOrigin: false,
     },
+    '/api/admin': {
+      target: `http://127.0.0.1:${shadowApiPort}`,
+      changeOrigin: false,
+    },
   }
   return {
   // Allows an isolated no-JSON runtime check while preserving the real public/ directory.
@@ -23,8 +27,11 @@ export default defineConfig(({ mode }) => {
     react(),
     tailwindcss(),
   ],
-  server: {
+    server: {
     proxy,
+    allowedHosts: [
+      'societies-cricket-chassis-deadline.trycloudflare.com',
+    ],
   },
   }
 })

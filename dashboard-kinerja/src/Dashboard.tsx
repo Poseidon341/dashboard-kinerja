@@ -6,10 +6,12 @@ import {
   LayoutDashboard, Building2, Search, Loader2, Award,
   LogOut, Lock, User, Landmark, Menu, ChevronLeft,
   Wallet, PieChart, Banknote, X, Filter, RotateCcw, ArrowUpDown,
-  Calendar, Info, ArrowUpRight, ArrowDownRight, Layers, Eye, Users, Activity
+  Calendar, Info, ArrowUpRight, ArrowDownRight, Layers, Eye, Users, Activity, UploadCloud
 } from 'lucide-react';
+import { AdminUpdateData } from './AdminUpdateData';
 import { getRkaValFromRow } from './rkaLookup';
 import { calculateCompleteDailyAverage } from './averageMetrics';
+import { createDetailOfficePlaceholder, getOfficeKcCode, getSourceOfficeType, matchesDetailOfficeScope, matchesDetailSourceScope, matchesSelectedOfficeType, normalizeOfficeType, resolveDetailOfficeType } from './detailUnitFilter.mjs';
 
 const namaBulanIndo = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
 
@@ -82,7 +84,7 @@ const REGION_MALANG_MAPPING: Record<string, string[]> = {
 };
 
 interface ChartItem {
-  day: number; dec25: number | null; jun26: number | null; jul26: number | null; aug26: number | null; sep26: number | null; oct26: number | null;
+  day: number; dec25: number | null; jun26: number | null; jul26: number | null; aug26: number | null; sep26: number | null; oct26: number | null; currentPeriod?: number | null;
 }
 
 type AuthStage = 'init' | 'login' | 'fetching_data' | 'dashboard' | 'error';
@@ -346,7 +348,8 @@ const MENU_ITEMS = [
   { name: 'Dashboard Posisi Dana', icon: LayoutDashboard }, 
   { name: 'Dashboard Marginal', icon: BarChart3 },
   { name: 'Detail Unit Kerja', icon: Building2 },
-  { name: 'Appraisal', icon: Award }
+  { name: 'Appraisal', icon: Award },
+  { name: 'Admin · Update Data', icon: UploadCloud }
 ];
 
 function BarChart3(props: any) {
@@ -358,8 +361,11 @@ export const Dashboard = () => {
   const [loadError, setLoadError] = useState('');
   const [dbRmft, setDbRmft] = useState<any[]>([]);
   const [dbSegmen, setDbSegmen] = useState<any[]>([]);
+  const [detailOfficeInventory, setDetailOfficeInventory] = useState<any[]>([]);
+  const [detailInventoryLoaded, setDetailInventoryLoaded] = useState(false);
   const loadedPositionScope = useRef('');
   const positionDataCache = useRef(new Map<string, any[]>());
+  const detailOfficeInventoryCache = useRef<any[] | null>(null);
   const [dbRka, setDbRka] = useState<any[]>([]); 
   const [dbUkerList, setDbUkerList] = useState<any[]>([]); 
   
@@ -534,6 +540,7 @@ export const Dashboard = () => {
   };
 
   const handleLogout = () => {
+    void fetch('/api/admin/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
     setLoggedInUser(null);
     setInputPN('');
     setShowProfile(false);
@@ -541,13 +548,29 @@ export const Dashboard = () => {
     setAuthStage('login');
   };
 
+  const handleAdminPublished = useCallback(() => {
+    positionDataCache.current.clear();
+    detailOfficeInventoryCache.current = null;
+    loadedPositionScope.current = '';
+    engineDataCache.clear();
+    setDbSegmen([]);
+    setPageFilters(previous => ({ ...previous,
+      'Dashboard Posisi Dana': { ...previous['Dashboard Posisi Dana'], periode: initialPageFilters.periode },
+    }));
+    setActiveMenu('Dashboard Posisi Dana');
+  }, []);
+
   useEffect(() => {
-    if (authStage === 'fetching_data' || authStage === 'dashboard') {
+    if ((authStage === 'fetching_data' || authStage === 'dashboard') && activeMenu !== 'Admin · Update Data') {
       const scope = activeMenu === 'Detail Unit Kerja' ? 'mysql-detail' : 'mysql-position';
       if (loadedPositionScope.current === scope && dbSegmen.length > 0) return;
       const cachedData = positionDataCache.current.get(scope);
       if (cachedData) {
         setDbSegmen(cachedData);
+        if (scope === 'mysql-detail') {
+          setDetailOfficeInventory(detailOfficeInventoryCache.current || []);
+          setDetailInventoryLoaded(Array.isArray(detailOfficeInventoryCache.current));
+        }
         loadedPositionScope.current = scope;
         if (authStage === 'fetching_data') setAuthStage('dashboard');
         return;
@@ -565,12 +588,14 @@ export const Dashboard = () => {
             throw new Error('API Posisi Dana tidak mengembalikan snapshot yang tervalidasi.');
           }
           if (!Array.isArray(data)) throw new Error(`${sourcePath}: format data tidak sesuai`);
+          const hasSourceOfficeInventory = scope === 'mysql-detail' && Array.isArray(payload?.sourceOfficeInventory);
+          const sourceOfficeInventory = hasSourceOfficeInventory ? payload.sourceOfficeInventory : [];
           const cleanedData = data.map((row: any) => {
             const cabangOri = String(row['Nama Cabang'] ?? '').trim().toUpperCase();
             let cabang = cabangOri.replace(/\(KONSOLIDASI.*/g, '').replace(/-MDI.*/g, '').trim();
 
             const ukerOri = String(row['Nama Uker'] ?? '').trim().toUpperCase() || cabang;
-            const kodeUkerOri = '';
+            const kodeUkerOri = row.officeCode == null ? '' : String(row.officeCode).trim();
             const segmen = String(row['Segmentasi BPR'] ?? '').toUpperCase().trim();
             const produk = String(row.Produk ?? '').toUpperCase().trim();
             
@@ -596,7 +621,8 @@ export const Dashboard = () => {
             }
 
             return {
-              cabang, ukerOri, kodeUkerOri, segmen, produk, saldo: saldoNum, y, m, d,
+              cabang, ukerOri, kodeUkerOri, sourceUnitType: getSourceOfficeType(ukerOri), mappingStatus: String(row.mappingStatus ?? ''),
+              segmen, produk, saldo: saldoNum, y, m, d,
               isTab: produk.includes('TABUNGAN') || produk.includes('TAB'),
               isGir: produk.includes('GIRO'),
               isDep: produk.includes('DEPOSITO') || produk.includes('DEP'),
@@ -607,7 +633,7 @@ export const Dashboard = () => {
           let maxTime = 0;
           let bestDate = '2026-10-07';
           cleanedData.forEach((row: any) => {
-            if (row.y === 2026) {
+            if (row.y >= 2025) {
               const t = new Date(row.y, row.m - 1, row.d).getTime();
               if (t > maxTime) {
                 maxTime = t;
@@ -623,6 +649,11 @@ export const Dashboard = () => {
           ) as Record<FilterMenuKey, PageFilters>);
           engineDataCache.clear();
           setDbSegmen(cleanedData); 
+          if (scope === 'mysql-detail') {
+            detailOfficeInventoryCache.current = hasSourceOfficeInventory ? sourceOfficeInventory : null;
+            setDetailOfficeInventory(sourceOfficeInventory);
+            setDetailInventoryLoaded(hasSourceOfficeInventory);
+          }
           positionDataCache.current.set(scope, cleanedData);
           loadedPositionScope.current = scope;
           setLoadError('');
@@ -657,9 +688,20 @@ export const Dashboard = () => {
   }, [loggedInUser]);
 
   const availableCabang = useMemo(() => {
-    if (selectedArea === 'ALL') return Object.values(REGION_MALANG_MAPPING).flat();
-    return REGION_MALANG_MAPPING[selectedArea] || [];
-  }, [selectedArea]);
+    const configured = selectedArea === 'ALL' ? Object.values(REGION_MALANG_MAPPING).flat() : (REGION_MALANG_MAPPING[selectedArea] || []);
+    if (activeMenu !== 'Detail Unit Kerja') return configured;
+    const configuredByNormalizedName = new Map(configured.map((name) => [String(name).trim().toUpperCase(), name]));
+    const sourceBranches = detailOfficeInventory.flatMap((item) => {
+      const label = String(item?.sourceBranchLabel ?? '').trim().replace(/^KC\s+/i, '')
+        .replace(/\(KONSOLIDASI.*/i, '').replace(/-MDI.*/i, '').trim();
+      if (!label) return [];
+      const canonical = configuredByNormalizedName.get(label.toUpperCase());
+      if (canonical) return [canonical];
+      if (selectedArea === 'ALL' && !Object.values(REGION_MALANG_MAPPING).flat().some((name) => String(name).trim().toUpperCase() === label.toUpperCase())) return [label];
+      return [];
+    });
+    return [...new Set([...configured, ...sourceBranches])].sort((a, b) => a.localeCompare(b, 'id-ID'));
+  }, [selectedArea, activeMenu, detailOfficeInventory]);
 
   const availableMonths = useMemo(() => {
     const lastDays = new Map<string, number>();
@@ -951,7 +993,8 @@ export const Dashboard = () => {
 
   // Resolve unit names through the branch master and use the branch's own code.
   // MAIN BRANCH CODE identifies the parent KC and must not be used for a unit.
-  const findKodeUker = (namaUker: string, kodeOri: any) => {
+  const findKodeUker = (namaUker: string, kodeOri: any, mappingStatus?: string) => {
+    if (mappingStatus === 'unresolved') return null;
     const suppliedCode = kodeOri === null || kodeOri === undefined ? '' : String(kodeOri).trim();
     if (suppliedCode && ukerByCode.has(suppliedCode)) return suppliedCode;
     if (!namaUker || !dbUkerList.length) {
@@ -1008,8 +1051,14 @@ export const Dashboard = () => {
       }
       let passUnit = true;
       if (dataUnit !== 'ALL') {
-        const uUpper = row.ukerOri.toUpperCase();
-        if (dataUnit === 'KC') passUnit = uUpper.startsWith('KC '); else if (dataUnit === 'KCP') passUnit = uUpper.includes('KCP'); else if (dataUnit === 'KK') passUnit = uUpper.includes('KK'); else if (dataUnit === 'UNIT') passUnit = uUpper.includes('UNIT');
+        if (isDetailMode) {
+          const officeCode = findKodeUker(row.ukerOri, row.kodeUkerOri, row.mappingStatus);
+          const office = officeCode ? ukerByCode.get(officeCode) : null;
+          passUnit = matchesSelectedOfficeType(office, dataUnit, row.ukerOri);
+        } else {
+          const uUpper = row.ukerOri.toUpperCase();
+          if (dataUnit === 'KC') passUnit = uUpper.startsWith('KC '); else if (dataUnit === 'KCP') passUnit = uUpper.includes('KCP'); else if (dataUnit === 'KK') passUnit = uUpper.includes('KK'); else if (dataUnit === 'UNIT') passUnit = uUpper.includes('UNIT');
+        }
       }
 
       if (passCabang && passSegmen && passProduk && passUnit) {
@@ -1028,14 +1077,14 @@ export const Dashboard = () => {
     const branchMap: Record<string, any> = {}; const ukerMap: Record<string, any> = {};
     const currentSnapshotDays = { dpk: new Set<number>(), tabungan: new Set<number>(), giro: new Set<number>(), deposito: new Set<number>() };
     const dec25Snapshots = { tabungan: false, giro: false, deposito: false };
-    const initChart = (): ChartItem[] => Array.from({ length: 31 }, (_, i) => ({ day: i + 1, dec25: null, jun26: null, jul26: null, aug26: null, sep26: null, oct26: null }));
+    const initChart = (): ChartItem[] => Array.from({ length: 31 }, (_, i) => ({ day: i + 1, dec25: null, jun26: null, jul26: null, aug26: null, sep26: null, oct26: null, currentPeriod: null }));
     const cTab = initChart(), cGir = initChart(), cDep = initChart(), cDpk = initChart();
     let dec25Tab = 0, dec25Gir = 0, dec25Dep = 0; let sumDec25Tab = 0, sumDec25Gir = 0, sumDec25Dep = 0; let sumSep1Tab = 0, sumSep1Gir = 0, sumSep1Dep = 0; let sumSep30Tab = 0, sumSep30Gir = 0, sumSep30Dep = 0;
 
     validRows.forEach(row => {
       if (row.isUkerKonsolidasi) return;
       const cleanUker = row.ukerOri.trim(); const ukerKey = `${row.cabang}-${cleanUker}`;
-      if (!ukerMap[ukerKey]) { ukerMap[ukerKey] = { uker: cleanUker, cabang: row.cabang, kode_uker: row.kodeUkerOri, curr_tab: 0, curr_gir: 0, curr_dep: 0, curr_dpk: 0, prev_dpk: 0, des25_dpk: 0, prev: 0, des25: 0, curr: 0, d_min_1: 0, has_curr: false, has_curr_tab: false, has_curr_gir: false, has_curr_dep: false, has_prev: false, has_d_min_1: false, has_des25: false, sum_tab: 0, sum_gir: 0, sum_dep: 0, sum_dpk: 0 }; }
+      if (!ukerMap[ukerKey]) { ukerMap[ukerKey] = { uker: cleanUker, cabang: row.cabang, kode_uker: row.kodeUkerOri, sourceUnitType: row.sourceUnitType, mappingStatus: row.mappingStatus, curr_tab: 0, curr_gir: 0, curr_dep: 0, curr_dpk: 0, prev_dpk: 0, des25_dpk: 0, prev: 0, des25: 0, curr: 0, d_min_1: 0, has_curr: false, has_curr_tab: false, has_curr_gir: false, has_curr_dep: false, has_prev: false, has_d_min_1: false, has_des25: false, sum_tab: 0, sum_gir: 0, sum_dep: 0, sum_dpk: 0 }; }
       ukerMap[ukerKey].posByDay ||= { dpk: {}, tabungan: {}, giro: {}, deposito: {} };
       ukerMap[ukerKey].monthlyPosByDay ||= { dpk: {}, tabungan: {}, giro: {}, deposito: {} };
       ukerMap[ukerKey].dailySnapshots ||= {};
@@ -1065,11 +1114,21 @@ export const Dashboard = () => {
         if (row.isTab) addMonthlyDay('tabungan');
         if (row.isGir) addMonthlyDay('giro');
         if (row.isDep) addMonthlyDay('deposito');
+        if (currY !== 2026 || currM < 6 || currM > 10) {
+          const idx = row.d - 1;
+          if (idx >= 0 && idx < 31) {
+            if (row.isTab) cTab[idx].currentPeriod = (cTab[idx].currentPeriod || 0) + row.saldo;
+            if (row.isGir) cGir[idx].currentPeriod = (cGir[idx].currentPeriod || 0) + row.saldo;
+            if (row.isDep) cDep[idx].currentPeriod = (cDep[idx].currentPeriod || 0) + row.saldo;
+          }
+        }
       }
 
       if (row.y === 2025 && row.m === 12 && row.d === 31) {
-        ukerMap[ukerKey].has_des25 = true;
-        ukerMap[ukerKey].des25_dpk += row.saldo; ukerMap[ukerKey].des25 += row.saldo;
+        if (currY === 2026) {
+          ukerMap[ukerKey].has_des25 = true;
+          ukerMap[ukerKey].des25_dpk += row.saldo; ukerMap[ukerKey].des25 += row.saldo;
+        }
         if (row.isTab) dec25Snapshots.tabungan = true;
         if (row.isGir) dec25Snapshots.giro = true;
         if (row.isDep) dec25Snapshots.deposito = true;
@@ -1140,8 +1199,12 @@ export const Dashboard = () => {
         if (cTab[i].jun26 === null) cTab[i].jun26 = cTab[i-1].jun26; if (cTab[i].jul26 === null) cTab[i].jul26 = cTab[i-1].jul26; if (cTab[i].aug26 === null) cTab[i].aug26 = cTab[i-1].aug26; if (cTab[i].sep26 === null) cTab[i].sep26 = cTab[i-1].sep26; if (cTab[i].oct26 === null) cTab[i].oct26 = cTab[i-1].oct26;
         if (cGir[i].jun26 === null) cGir[i].jun26 = cGir[i-1].jun26; if (cGir[i].jul26 === null) cGir[i].jul26 = cGir[i-1].jul26; if (cGir[i].aug26 === null) cGir[i].aug26 = cGir[i-1].aug26; if (cGir[i].sep26 === null) cGir[i].sep26 = cGir[i-1].sep26; if (cGir[i].oct26 === null) cGir[i].oct26 = cGir[i-1].oct26;
         if (cDep[i].jun26 === null) cDep[i].jun26 = cDep[i-1].jun26; if (cDep[i].jul26 === null) cDep[i].jul26 = cDep[i-1].jul26; if (cDep[i].aug26 === null) cDep[i].aug26 = cDep[i-1].aug26; if (cDep[i].sep26 === null) cDep[i].sep26 = cDep[i-1].sep26; if (cDep[i].oct26 === null) cDep[i].oct26 = cDep[i-1].oct26;
+        if (cTab[i].currentPeriod === null) cTab[i].currentPeriod = cTab[i-1].currentPeriod;
+        if (cGir[i].currentPeriod === null) cGir[i].currentPeriod = cGir[i-1].currentPeriod;
+        if (cDep[i].currentPeriod === null) cDep[i].currentPeriod = cDep[i-1].currentPeriod;
       }
       const currentDay = i + 1;
+      if (currentDay > currD) { cTab[i].currentPeriod = null; cGir[i].currentPeriod = null; cDep[i].currentPeriod = null; }
       if (currM < 6 || (currM === 6 && currentDay > currD)) { cTab[i].jun26 = null; cGir[i].jun26 = null; cDep[i].jun26 = null;}
       if (currM < 7 || (currM === 7 && currentDay > currD)) { cTab[i].jul26 = null; cGir[i].jul26 = null; cDep[i].jul26 = null;}
       if (currM < 8 || (currM === 8 && currentDay > currD)) { cTab[i].aug26 = null; cGir[i].aug26 = null; cDep[i].aug26 = null;}
@@ -1153,6 +1216,8 @@ export const Dashboard = () => {
       cDpk[i].aug26 = (cTab[i].aug26 !== null || cGir[i].aug26 !== null || cDep[i].aug26 !== null) ? (cTab[i].aug26 || 0) + (cGir[i].aug26 || 0) + (cDep[i].aug26 || 0) : null;
       cDpk[i].sep26 = (cTab[i].sep26 !== null || cGir[i].sep26 !== null || cDep[i].sep26 !== null) ? (cTab[i].sep26 || 0) + (cGir[i].sep26 || 0) + (cDep[i].sep26 || 0) : null;
       cDpk[i].oct26 = (cTab[i].oct26 !== null || cGir[i].oct26 !== null || cDep[i].oct26 !== null) ? (cTab[i].oct26 || 0) + (cGir[i].oct26 || 0) + (cDep[i].oct26 || 0) : null;
+      cDpk[i].currentPeriod = (cTab[i].currentPeriod !== null || cGir[i].currentPeriod !== null || cDep[i].currentPeriod !== null)
+        ? (cTab[i].currentPeriod || 0) + (cGir[i].currentPeriod || 0) + (cDep[i].currentPeriod || 0) : null;
     }
 
     let currMonthKey: 'dec25'|'jun26'|'jul26'|'aug26'|'sep26'|'oct26'|null = null; let lastMonthKey: 'dec25'|'jun26'|'jul26'|'aug26'|'sep26'|'oct26'|null = null;
@@ -1218,7 +1283,7 @@ export const Dashboard = () => {
         ? `${currY}-${String(currM).padStart(2, '0')}-${String(lastDay - 1).padStart(2, '0')}`
         : (() => { const date = new Date(currY, currM - 1, 0); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; })();
       const monthEndDate = (() => { const date = new Date(currY, currM - 1, 0); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; })();
-      const yearEndDate = '2025-12-31';
+      const yearEndDate = `${currY - 1}-12-31`;
       const units = Object.values(ukerMap) as any[];
       const activeUnits = units.filter(unit => Object.keys(unit.monthlyPosByDay?.[product] || {}).length > 0);
       const totalAt = (dateKey: string) => {
@@ -1243,7 +1308,16 @@ export const Dashboard = () => {
     };
     const monthlyDatesAvailable = (product: ProductKey) => dailyTotals[product].size;
     const currentDatesAvailable = (product: ProductKey) => [...dailyTotals[product].keys()].filter(day => day <= requiredCurrentDays).length;
-    const statsTab = calculateStats(cTab, rawTab, dec25Snapshots.tabungan); const statsGir = calculateStats(cGir, rawGir, dec25Snapshots.giro); const statsDep = calculateStats(cDep, rawDep, dec25Snapshots.deposito); const statsDpk = calculateStats(cDpk, rawDpk, hasDec25Dpk);
+    const dynamicStats = (product: ProductKey) => {
+      const day = productLastDay(product);
+      const val = day ? dailyTotals[product].get(day) ?? null : null;
+      const movement = snapshotMovement(product);
+      return { val, dtd: movement.dtd, mtd: movement.mtd, mtm: null, ytd: movement.ytd, snapshotDay: day || null };
+    };
+    const statsTab = currMonthKey ? calculateStats(cTab, rawTab, dec25Snapshots.tabungan) : dynamicStats('tabungan');
+    const statsGir = currMonthKey ? calculateStats(cGir, rawGir, dec25Snapshots.giro) : dynamicStats('giro');
+    const statsDep = currMonthKey ? calculateStats(cDep, rawDep, dec25Snapshots.deposito) : dynamicStats('deposito');
+    const statsDpk = currMonthKey ? calculateStats(cDpk, rawDpk, hasDec25Dpk) : dynamicStats('dpk');
     const summaryDay = effectiveD || currD;
     const summaryDayIdx = Math.min(Math.max(summaryDay - 1, 0), 30);
     const currentMonthLabel = `${namaBulanIndo[currM - 1] ?? ''} '${String(currY).slice(-2)}`;
@@ -1277,20 +1351,20 @@ export const Dashboard = () => {
     engineDataCache.set(cacheKey, result);
     if (engineDataCache.size > 6) engineDataCache.delete(engineDataCache.keys().next().value!);
     return result;
-  }, [dbSegmen, dataArea, dataCabang, dataUnit, selectedSegmen, selectedProduk, selectedPeriode, isDetailDataMode, isMarginalDataMode]);
+  }, [dbSegmen, dataArea, dataCabang, dataUnit, selectedSegmen, selectedProduk, selectedPeriode, isDetailDataMode, isMarginalDataMode, branchCodeByName, ukerByCode]);
   const modalChartData = useMemo(() => {
     if (!selectedUkerModal || dbSegmen.length === 0) return null;
 
-    let currM = 10, currD = 7;
+    let currY = 2026, currM = 10, currD = 7;
     if (selectedPeriode) {
       const parts = selectedPeriode.split(/[-/]/);
       if (parts.length >= 3) {
         let p0 = parseInt(parts[0], 10), p1 = parseInt(parts[1], 10), p2 = parseInt(parts[2].substring(0, 4), 10);
-        if (p2 > 2000) { currM = p1; currD = p0; } else if (p0 > 2000) { currM = p1; currD = p2; }
+        if (p2 > 2000) { currY = p2; currM = p1; currD = p0; } else if (p0 > 2000) { currY = p0; currM = p1; currD = p2; }
       }
     }
 
-    const initChart = (): ChartItem[] => Array.from({ length: 31 }, (_, i) => ({ day: i + 1, dec25: null, jun26: null, jul26: null, aug26: null, sep26: null, oct26: null }));
+    const initChart = (): ChartItem[] => Array.from({ length: 31 }, (_, i) => ({ day: i + 1, dec25: null, jun26: null, jul26: null, aug26: null, sep26: null, oct26: null, currentPeriod: null }));
     const cTab = initChart();
     let dec25Tab = 0;
     let hasDec25Tab = false;
@@ -1314,6 +1388,10 @@ export const Dashboard = () => {
             else if (row.m === 9) cTab[idx].sep26 = (cTab[idx].sep26 || 0) + row.saldo;
             else if (row.m === 10) cTab[idx].oct26 = (cTab[idx].oct26 || 0) + row.saldo;
           }
+          if (row.y === currY && row.m === currM && (currY !== 2026 || currM < 6 || currM > 10)) {
+            const idx = row.d - 1;
+            if (idx >= 0 && idx < 31) cTab[idx].currentPeriod = (cTab[idx].currentPeriod || 0) + row.saldo;
+          }
         }
       }
     });
@@ -1326,8 +1404,10 @@ export const Dashboard = () => {
         if (cTab[i].aug26 === null) cTab[i].aug26 = cTab[i-1].aug26; 
         if (cTab[i].sep26 === null) cTab[i].sep26 = cTab[i-1].sep26; 
         if (cTab[i].oct26 === null) cTab[i].oct26 = cTab[i-1].oct26;
+        if (cTab[i].currentPeriod === null) cTab[i].currentPeriod = cTab[i-1].currentPeriod;
       }
       const currentDay = i + 1;
+      if (currentDay > currD) cTab[i].currentPeriod = null;
       if (currM < 6 || (currM === 6 && currentDay > currD)) cTab[i].jun26 = null; 
       if (currM < 7 || (currM === 7 && currentDay > currD)) cTab[i].jul26 = null; 
       if (currM < 8 || (currM === 8 && currentDay > currD)) cTab[i].aug26 = null; 
@@ -1337,13 +1417,71 @@ export const Dashboard = () => {
     return cTab;
   }, [selectedUkerModal, dbSegmen, selectedPeriode]);
 
+  const detailMasterPlaceholders = useMemo(() => {
+    if (!isDetailDataMode) return [];
+    const existingCodes = new Set(engineData.ukerList
+      .map((unit: any) => findKodeUker(unit.uker, unit.kode_uker, unit.mappingStatus))
+      .filter((code: string | null): code is string => Boolean(code)));
+    const existingLabels = new Set(engineData.ukerList.map((unit: any) => String(unit.uker ?? '').trim().toUpperCase()));
+    const inventoryByCode = new Map<string, any>();
+    detailOfficeInventory.forEach((item) => {
+      const code = String(item?.officeCode ?? '').trim();
+      if (code && !inventoryByCode.has(code)) inventoryByCode.set(code, item);
+    });
+
+    const masterPlaceholders = dbUkerList.flatMap((office) => {
+      const code = String(office?.['BRANCH CODE'] ?? '').trim();
+      const inventory = inventoryByCode.get(code);
+      const sourceLabel = String(inventory?.officeLabel ?? '').trim();
+      const masterType = normalizeOfficeType(office?.['BRANCH TYPE']);
+      const type = resolveDetailOfficeType(office, sourceLabel);
+      if (!['KC', 'KCP', 'KK', 'UNIT'].includes(type || '') || !matchesSelectedOfficeType(office, selectedUnit, sourceLabel)) return [];
+      if (!code || existingCodes.has(code)) return [];
+
+      const sourceTypeConflict = Boolean(inventory?.sourceType && masterType && inventory.sourceType !== masterType);
+      const kcCode = sourceTypeConflict ? null : getOfficeKcCode(office);
+      const parentCandidate = kcCode ? ukerByCode.get(kcCode) : null;
+      const parentKc = !sourceTypeConflict && type === 'KC'
+        ? office
+        : !sourceTypeConflict && normalizeOfficeType(parentCandidate?.['BRANCH TYPE']) === 'KC' ? parentCandidate : null;
+      const inScope = sourceTypeConflict
+        ? matchesDetailSourceScope(inventory?.sourceBranchLabel, dataArea, dataCabang, REGION_MALANG_MAPPING)
+        : matchesDetailOfficeScope(office, parentKc, dataArea, dataCabang, REGION_MALANG_MAPPING);
+      if (!inScope) return [];
+      const label = sourceLabel || String(office?.BRANCH ?? '').trim();
+      const placeholder = createDetailOfficePlaceholder({ ...office, BRANCH: label }, parentKc?.BRANCH || inventory?.sourceBranchLabel, {
+        unitType: type || undefined,
+        sourceTypeConflict,
+        noDetailMetricInSource: !inventory || Number(inventory.detailMetricGroups) === 0,
+      });
+      return [placeholder];
+    });
+
+    const unresolvedSourcePlaceholders = detailOfficeInventory.flatMap((item) => {
+      const officeCode = String(item?.officeCode ?? '').trim();
+      const label = String(item?.officeLabel ?? '').trim();
+      if (officeCode || !label || existingLabels.has(label.toUpperCase())) return [];
+      const type = item?.sourceType ? normalizeOfficeType(item.sourceType) : null;
+      if (selectedUnit !== 'ALL' && type !== selectedUnit) return [];
+      if (!matchesDetailSourceScope(item?.sourceBranchLabel, dataArea, dataCabang, REGION_MALANG_MAPPING)) return [];
+      const placeholder = createDetailOfficePlaceholder({ BRANCH: label, 'BRANCH CODE': '' }, item?.sourceBranchLabel || label, {
+        unitType: type || undefined,
+        mappingUnresolved: true,
+        noDetailMetricInSource: Number(item.detailMetricGroups) === 0,
+      });
+      placeholder.kode_uker = '';
+      return [placeholder];
+    });
+    return [...masterPlaceholders, ...unresolvedSourcePlaceholders];
+  }, [isDetailDataMode, engineData.ukerList, dbUkerList, detailOfficeInventory, selectedUnit, dataArea, dataCabang, ukerByCode]);
+
   const handleSort = (field: SortField) => {
     if (sortField === field) setSortAsc(!sortAsc);
     else { setSortField(field); setSortAsc(false); }
   };
 
   const processedTableData = useMemo(() => {
-    let data = [...engineData.ukerList];
+    let data = [...engineData.ukerList, ...detailMasterPlaceholders];
     if (searchUker) { 
       const s = searchUker.toUpperCase();
       data = data.filter(d => d.uker.toUpperCase().includes(s) || d.cabang.toUpperCase().includes(s)); 
@@ -1356,7 +1494,7 @@ export const Dashboard = () => {
       return sortAsc ? valA - valB : valB - valA;
     });
     return data;
-  }, [engineData.ukerList, searchUker, sortField, sortAsc]);
+  }, [engineData.ukerList, detailMasterPlaceholders, searchUker, sortField, sortAsc]);
 
   const displayedTableData = processedTableData;
 
@@ -1408,30 +1546,39 @@ export const Dashboard = () => {
   };
 
   const detailRkaByUnit = useMemo(() => new Map(displayedTableData.map(unit => {
-    const kode = findKodeUker(unit.uker, unit.kode_uker);
-    const monthly = getRkaTargetResult(kode, 'A Tabungan Retail Funding');
-    const december = getRkaTargetResult(kode, 'A Tabungan Retail Funding', 11);
+    const kode = unit.mappingUnresolved ? null : findKodeUker(unit.uker, unit.kode_uker, unit.mappingStatus);
     const master = kode ? ukerByCode.get(kode) : null;
-    const unitType = String(master?.['BRANCH TYPE'] ?? '').trim().toUpperCase();
-    const mainBranchCode = String(master?.['MAIN BRANCH CODE'] ?? '').trim();
-    const kcCode = unitType === 'KC' ? kode : mainBranchCode;
+    const masterType = normalizeOfficeType(master?.['BRANCH TYPE']);
+    const sourceType = normalizeOfficeType(unit.sourceUnitType ?? unit.unitType);
+    const sourceTypeConflict = unit.sourceTypeConflict === true
+      || Boolean(unit.sourceUnitType && masterType && unit.sourceUnitType !== masterType);
+    const unitType = sourceType || masterType;
+    const candidateKcCode = sourceTypeConflict ? null : getOfficeKcCode(master);
+    const candidateKc = candidateKcCode ? ukerByCode.get(candidateKcCode) : null;
+    const kcCode = !sourceTypeConflict && unitType === 'KC' ? kode
+      : !sourceTypeConflict && normalizeOfficeType(candidateKc?.['BRANCH TYPE']) === 'KC' ? candidateKcCode : null;
+    const suppressTarget = unit.mappingUnresolved || sourceTypeConflict;
+    const monthly = suppressTarget ? { value: null, reason: unit.mappingUnresolved ? 'Kode kantor sumber belum terpetakan; target RKA tidak dihubungkan.' : 'Tipe kantor pada sumber berbeda dari master; target RKA tidak dihubungkan.' }
+      : getRkaTargetResult(kode, 'A Tabungan Retail Funding');
+    const december = suppressTarget ? monthly : getRkaTargetResult(kode, 'A Tabungan Retail Funding', 11);
     return [unit, {
       kode,
-      unitType: ['KC', 'KCP', 'UNIT'].includes(unitType) ? unitType : '—',
+      unitType: ['KC', 'KCP', 'KK', 'UNIT'].includes(unitType) ? unitType : '—',
       kcCode: kcCode || null,
       kcName: kcCode ? (branchNameByCode.get(kcCode) || null) : null,
       monthly: monthly.value,
       monthlyStatus: monthly.reason,
       december: december.value,
-      decemberStatus: december.reason
+      decemberStatus: december.reason,
+      sourceBranchOnly: sourceTypeConflict || unit.mappingUnresolved === true
     }];
   })), [displayedTableData, branchCodeByName, branchNameByCode, ukerByCode, rkaRowsByCodeCategory, selectedPeriode, monthColsIdx]);
   const groupedDetailData = useMemo(() => {
     const groups = new Map<string, { name: string; kcCode: string | null; units: any[] }>();
     displayedTableData.forEach(unit => {
       const metadata = detailRkaByUnit.get(unit);
-      const key = metadata?.kcCode ? `KC:${metadata.kcCode}` : `NAME:${unit.cabang}`;
-      const name = metadata?.kcName || unit.cabang;
+      const key = metadata?.kcCode ? `KC:${metadata.kcCode}` : `NAME:${unit.kode_uker || unit.uker}:${unit.cabang}`;
+      const name = metadata?.sourceBranchOnly ? `Lokasi sumber: ${unit.cabang}` : metadata?.kcName || unit.cabang;
       if (!groups.has(key)) groups.set(key, { name, kcCode: metadata?.kcCode || null, units: [] });
       groups.get(key)!.units.push(unit);
     });
@@ -1456,7 +1603,10 @@ export const Dashboard = () => {
   const detailGroupTotals = (units: any[]) => {
     const totals = { rka: 0, rkaDec: 0, des25: 0, prev: 0, d1: 0, curr: 0 };
     const complete = { rka: true, rkaDec: true, des25: true, prev: true, d1: true, curr: true };
+    let measuredUnitCount = 0;
     units.forEach(unit => {
+      if (unit.synthetic) return;
+      measuredUnitCount += 1;
       const rka = detailRkaByUnit.get(unit);
       if (rka?.monthly === null || rka?.monthly === undefined) complete.rka = false; else totals.rka += rka.monthly;
       if (rka?.december === null || rka?.december === undefined) complete.rkaDec = false; else totals.rkaDec += rka.december;
@@ -1465,6 +1615,9 @@ export const Dashboard = () => {
       if (unit.has_d_min_1) totals.d1 += unit.d_min_1; else complete.d1 = false;
       if (unit.has_curr) totals.curr += unit.curr; else complete.curr = false;
     });
+    if (measuredUnitCount === 0) {
+      Object.keys(complete).forEach((key) => { complete[key as keyof typeof complete] = false; });
+    }
     return { totals, complete };
   };
   const detailChildrenForGroup = (group: { name: string; kcCode: string | null; units: any[] }) => {
@@ -1487,6 +1640,15 @@ export const Dashboard = () => {
   };
   const unitsWithoutCode = useMemo(() => [...detailRkaByUnit.values()].filter(rka => !rka.kode).length, [detailRkaByUnit]);
   const unitsWithoutTarget = useMemo(() => [...detailRkaByUnit.values()].filter(rka => rka.monthly === null || rka.december === null).length, [detailRkaByUnit]);
+  const detailMasterTypeCount = selectedUnit === 'ALL' ? null : new Set([
+    ...dbUkerList.flatMap((office) => {
+      const code = String(office?.['BRANCH CODE'] ?? '').trim();
+      const inventory = detailOfficeInventory.find((item) => String(item?.officeCode ?? '').trim() === code);
+      return resolveDetailOfficeType(office, inventory?.officeLabel) === selectedUnit ? [`CODE:${code}`] : [];
+    }),
+    ...detailOfficeInventory.flatMap((item) => !item?.officeCode && normalizeOfficeType(item?.sourceType) === selectedUnit
+      ? [`LABEL:${String(item.officeLabel ?? '')}`] : []),
+  ]).size;
 
   const calculateRkaAggregate = (targetCategory: string) => {
     const units = engineData.ukerList;
@@ -2410,6 +2572,11 @@ const renderDetailUnitKerja = () => {
         <p className="mb-3 rounded-lg border border-slate-200 bg-white/80 px-3 py-2 text-[10px] leading-relaxed text-slate-500">
           Baris KC merangkum setiap kantor sumber unik dalam cakupan sekali. Master menyediakan relasi KCP dan UNIT langsung ke KC, tetapi tidak menyediakan relasi induk KCP untuk UNIT; karena itu KCP dan UNIT ditampilkan sebagai baris turunan KC tanpa mengarang pengelompokan di antaranya.
         </p>
+        <p className="mb-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-[10px] leading-relaxed text-blue-900">
+          Nilai pada tabel ini khusus TABUNGAN (MIKRO). {detailInventoryLoaded
+            ? 'Filter tipe memakai awalan KC/KCP/KK/UNIT pada Nama Uker sumber bila tersedia; jika berbeda dari tipe master, baris ditampilkan terpisah tanpa relasi induk atau target RKA.'
+            : 'Backend yang sedang berjalan belum mengirim inventaris klasifikasi sumber; filter sementara memakai tipe master. Restart backend untuk mengaktifkan klasifikasi KC/KCP/KK dari sumber posisi.'} Placeholder bertanda abu-abu berarti record TABUNGAN (MIKRO) tidak tersedia untuk kantor/periode tersebut.
+        </p>
 
         <div className="min-w-0 bg-white rounded-xl border border-slate-300 shadow-sm mb-4 overflow-x-auto text-[10px]">
           <div className="min-w-0 p-3 border-b border-slate-300 flex flex-col gap-3 bg-slate-50 sm:flex-row sm:items-center sm:justify-between">
@@ -2452,7 +2619,15 @@ const renderDetailUnitKerja = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-300">
-              {groupedDetailData.map(({ name: cabangName, kcCode, units: groupedUnits }, cIdx) => {
+              {groupedDetailData.length === 0 ? (
+                <tr><td colSpan={14} className="px-4 py-8 text-center text-sm text-slate-500">
+                  {selectedUnit !== 'ALL' && detailMasterTypeCount === 0
+                    ? detailInventoryLoaded
+                      ? `Tidak ditemukan kantor bertipe ${selectedUnit} pada master maupun klasifikasi Nama Uker di sumber posisi.`
+                      : `Backend belum mengirim inventaris sumber; master tidak memiliki kantor bertipe ${selectedUnit}. Restart backend untuk memeriksa tipe dari Nama Uker sumber.`
+                    : 'Tidak ada kantor yang sesuai dengan kombinasi filter Area, Kantor Cabang, Tipe Unit, dan periode ini.'}
+                </td></tr>
+              ) : groupedDetailData.map(({ name: cabangName, kcCode, units: groupedUnits }, cIdx) => {
                 const { totals, complete } = detailGroupTotals(groupedUnits);
                 const ukers = detailChildrenForGroup({ name: cabangName, kcCode, units: groupedUnits });
                 const kcPercentage = complete.rka && complete.curr && totals.rka > 0 ? totals.curr / totals.rka * 100 : null;
@@ -2479,7 +2654,7 @@ const renderDetailUnitKerja = () => {
                     {ukers.map((u: any, i: number) => {
                       const rkaDetail = detailRkaByUnit.get(u) || {
                         unitType: u.unitType || 'KCP', monthly: null, monthlyStatus: 'Tidak ada baris sumber untuk kantor ini.',
-                        december: null, decemberStatus: 'Tidak ada baris sumber untuk kantor ini.'
+                        december: null, decemberStatus: 'Tidak ada baris sumber untuk kantor ini.', sourceBranchOnly: false
                       };
                       const rkaUker = rkaDetail.monthly;
                       const rkaUkerDec = rkaDetail.december;
@@ -2494,6 +2669,9 @@ const renderDetailUnitKerja = () => {
                           <td className="p-1.5 text-center">{cIdx + 1}.{i + 1}</td>
                           <td className="p-1.5 text-left font-bold text-[#004a8c]" title={rkaDetail.monthlyStatus || undefined}>
                             <span className={rkaDetail.unitType === 'KC' ? '' : 'pl-4'}>{u.uker}</span>
+                            {(u.mappingUnresolved || u.mappingStatus === 'unresolved' || u.sourceTypeConflict || rkaDetail.sourceBranchOnly || u.noDetailMetricInSource) && <span className="mt-0.5 block pl-4 text-[9px] font-medium text-slate-500">
+                              {u.mappingUnresolved || u.mappingStatus === 'unresolved' ? 'Belum terpetakan ke master kantor' : u.sourceTypeConflict || rkaDetail.sourceBranchOnly ? 'Tipe sumber berbeda dari master; relasi/RKA tidak dipaksakan' : 'Tidak ada record TABUNGAN (MIKRO) pada sumber'}
+                            </span>}
                             {rkaUker === null && !u.synthetic && <span className="ml-1 text-amber-600" aria-label="Target tidak terverifikasi">⚠</span>}
                           </td>
                           <td className="p-1.5 text-center">{rkaDetail.unitType}</td>
@@ -2599,6 +2777,10 @@ const renderDetailUnitKerja = () => {
           <Area hide={!visibleLines.aug26} type="monotone" dataKey="aug26" name="Agu '26" stroke="#475569" strokeWidth={3} fill="transparent" dot={false} isAnimationActive={false} />
           <Area hide={!visibleLines.sep26} type="monotone" dataKey="sep26" name="Sep '26" stroke="#94a3b8" fill={`url(#gradPrev-${dataKeyName})`} strokeWidth={3} dot={{ r: 0 }} activeDot={{ r: 6 }} isAnimationActive={false} />
           <Area hide={!visibleLines.oct26} type="monotone" dataKey="oct26" name="Okt '26" stroke={primaryColor} fill={`url(#gradCurr-${dataKeyName})`} strokeWidth={4} dot={{ r: 0 }} activeDot={{ r: 6 }} connectNulls={false} isAnimationActive={false} />
+          {selectedPeriode && (selectedPeriode.slice(0, 7) < '2026-06' || selectedPeriode.slice(0, 7) > '2026-10') &&
+            <Area hide={visibleLines.currentPeriod === false} type="monotone" dataKey="currentPeriod"
+              name={`${namaBulanIndo[Number(selectedPeriode.slice(5, 7)) - 1]} '${selectedPeriode.slice(2, 4)}`}
+              stroke={primaryColor} fill={`url(#gradCurr-${dataKeyName})`} strokeWidth={4} dot={false} isAnimationActive={false} />}
         </AreaChart>
       </ResponsiveContainer>
     </div>
@@ -2716,6 +2898,7 @@ const renderDetailUnitKerja = () => {
           {activeMenu === 'Dashboard Marginal' && renderDashboardMarginal()}
           {activeMenu === 'Detail Unit Kerja' && renderDetailUnitKerja()}
           {activeMenu === 'Appraisal' && renderDashboardAppraisal()}
+          {activeMenu === 'Admin · Update Data' && <AdminUpdateData onPublished={handleAdminPublished} />}
         </div>
       </div>
     </div>

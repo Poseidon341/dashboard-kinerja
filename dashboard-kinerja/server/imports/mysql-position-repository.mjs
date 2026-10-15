@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { assertExpectedImportTarget } from './mysql-uker-repository.mjs';
+import { resolveRuntimeTarget, assertActualRuntimeTarget } from '../runtime-target.mjs';
 
 const REQUIRED_COLUMNS = Object.freeze({
   dashboard_source_registry: ['source_id', 'source_key', 'source_type', 'display_name', 'source_location'],
@@ -54,10 +55,14 @@ export function assertPositionTestTarget(config) {
 }
 
 export class MysqlPositionRepository {
-  constructor(pool, config) {
-    assertPositionTestTarget(config);
+  constructor(pool, config, { allowProductionAdmin = false, env = process.env } = {}) {
+    if (allowProductionAdmin) resolveRuntimeTarget(config, env);
+    else assertPositionTestTarget(config);
     this.pool = pool;
     this.database = config.database;
+    this.config = config;
+    this.env = env;
+    this.allowProductionAdmin = allowProductionAdmin;
     this.connection = null;
   }
 
@@ -66,8 +71,13 @@ export class MysqlPositionRepository {
     this.connection = connection;
     let acquired = false;
     try {
-      const [databaseRows] = await connection.execute('SELECT DATABASE() AS database_name');
-      if (databaseRows[0]?.database_name !== this.database) throw new Error('Database aktif tidak sesuai target impor yang diizinkan.');
+      if (this.allowProductionAdmin) await assertActualRuntimeTarget(connection, this.config, this.env);
+      else {
+        const [databaseRows] = await connection.execute('SELECT DATABASE() AS database_name, @@port AS server_port');
+        if (databaseRows[0]?.database_name !== this.database || Number(databaseRows[0]?.server_port) !== 3308) {
+          throw new Error('Database atau port aktif tidak sesuai target impor yang diizinkan.');
+        }
+      }
       const lockName = `dashboard_import:${sourceKey}`;
       const [lockRows] = await connection.execute('SELECT GET_LOCK(?, 15) AS acquired', [lockName]);
       acquired = Number(lockRows[0]?.acquired) === 1;
@@ -133,8 +143,9 @@ export class MysqlPositionRepository {
     if (absent.length) throw new Error(`Foreign key impor Posisi Dana tidak tersedia: ${absent.join(', ')}.`);
   }
 
-  async reserveBatch({ sourceKey, objectKey, parserVersion, checksum, sourceSizeBytes, sourceRowCount, validationSummary, sourceSystem }) {
+  async reserveBatch({ sourceKey, objectKey, parserVersion, checksum, sourceSizeBytes, sourceRowCount, validationSummary, sourceSystem, sourceLocation = null }) {
     const connection = this.connection;
+    const location = sourceLocation || 'data/import/dashboard_funding.xlsx';
     await connection.beginTransaction();
     try {
       const [sourceRows] = await connection.execute('SELECT source_id,source_type FROM dashboard_source_registry WHERE source_key=? FOR UPDATE', [sourceKey]);
@@ -142,14 +153,14 @@ export class MysqlPositionRepository {
       if (sourceId === undefined) {
         const [insertSource] = await connection.execute(
           'INSERT INTO dashboard_source_registry (source_key,source_type,display_name,source_location) VALUES (?,\'xlsx_file\',?,?)',
-          [sourceKey, 'Posisi Dana (staging)', 'data/import/dashboard_funding.xlsx'],
+          [sourceKey, 'Posisi Dana (staging)', location],
         );
         sourceId = insertSource.insertId;
       } else if (!['json_file', 'xlsx_file'].includes(sourceRows[0].source_type)) throw new Error('Registry sumber Posisi Dana memiliki source_type berbeda.');
       else if (sourceRows[0].source_type !== 'xlsx_file') {
-        await connection.execute('UPDATE dashboard_source_registry SET source_type=\'xlsx_file\',source_location=? WHERE source_id=?', ['data/import/dashboard_funding.xlsx', sourceId]);
+        await connection.execute('UPDATE dashboard_source_registry SET source_type=\'xlsx_file\',source_location=? WHERE source_id=?', [location, sourceId]);
       } else {
-        await connection.execute('UPDATE dashboard_source_registry SET source_location=? WHERE source_id=?', ['data/import/dashboard_funding.xlsx', sourceId]);
+        await connection.execute('UPDATE dashboard_source_registry SET source_location=? WHERE source_id=?', [location, sourceId]);
       }
 
       const [idempotencyRows] = await connection.execute(
