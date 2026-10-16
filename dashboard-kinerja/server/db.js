@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import mysql from 'mysql2/promise';
+import { resolveRuntimeTarget, assertActualRuntimeTarget } from './runtime-target.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const envFile = resolve(projectRoot, '.env');
@@ -115,6 +116,62 @@ export async function checkDatabaseConnection() {
   } finally {
     connection.release();
   }
+}
+
+// SELECT-only preflight shared by startup and the manual hosting check.
+export async function checkRuntimeDatabase({
+  env = process.env, getConfig = getDatabaseConfig, getPool = getDatabasePool,
+} = {}) {
+  const config = getConfig(env);
+  let target;
+  try { target = resolveRuntimeTarget(config, env); }
+  catch {
+    const error = new Error('Konfigurasi target runtime ditolak.');
+    error.code = env.DASHBOARD_RUNTIME_ENV === 'production'
+      ? 'PRODUCTION_TARGET_CONFIGURATION_MISMATCH'
+      : 'DEVELOPMENT_TARGET_CONFIGURATION_MISMATCH';
+    if (env.DASHBOARD_RUNTIME_ENV && !['development', 'production'].includes(env.DASHBOARD_RUNTIME_ENV)) {
+      error.code = 'INVALID_RUNTIME_ENV';
+    }
+    throw error;
+  }
+  const connection = await getPool().getConnection();
+  try {
+    try { await assertActualRuntimeTarget(connection, config, env); }
+    catch (error) {
+      if (error?.code === 'RUNTIME_TARGET_NOT_ALLOWED') {
+        const mismatch = new Error('Identitas database aktual tidak sesuai target.');
+        mismatch.code = 'ACTUAL_RUNTIME_TARGET_MISMATCH';
+        throw mismatch;
+      }
+      throw error;
+    }
+    return target;
+  } finally { connection.release(); }
+}
+
+export function getHostingErrorInfo(error) {
+  const info = getDatabaseErrorInfo(error);
+  const reasons = {
+    DEVELOPMENT_TARGET_CONFIGURATION_MISMATCH: 'Development memerlukan host 127.0.0.1/localhost, port 3308, database dashboard_funding_test.',
+    PRODUCTION_TARGET_CONFIGURATION_MISMATCH: 'Allowlist DASHBOARD_PRODUCTION_DB_HOST/PORT/NAME harus valid dan cocok dengan MYSQL_HOST/PORT/DATABASE.',
+    INVALID_RUNTIME_ENV: 'DASHBOARD_RUNTIME_ENV harus development atau production.',
+    ACTUAL_RUNTIME_TARGET_MISMATCH: 'Hasil DATABASE() atau @@port berbeda dari target yang diizinkan.',
+    INVALID_MYSQL_PORT: 'MYSQL_PORT bukan port TCP yang valid.',
+    INVALID_MYSQL_CONNECTION_LIMIT: 'MYSQL_CONNECTION_LIMIT harus bilangan bulat 1 sampai 50.',
+    MYSQL_TLS_REQUIRED: 'MySQL production non-loopback memerlukan MYSQL_SSL_CA_FILE.',
+    INVALID_MYSQL_SSL_CA_FILE: 'File CA MySQL tidak dapat dibaca.',
+    INVALID_ENV_FILE: 'File environment lokal tidak dapat dimuat.',
+    ENV_FILE_UNSUPPORTED: 'Versi Node.js belum mendukung pemuatan environment lokal.',
+    INVALID_SHADOW_API_PORT: 'SHADOW_API_PORT bukan port TCP yang valid.',
+    ECONNREFUSED: 'Koneksi ditolak; periksa service MySQL dan host/port.',
+    ETIMEDOUT: 'Koneksi MySQL melewati batas waktu.',
+    ER_ACCESS_DENIED_ERROR: 'MySQL menolak autentikasi akun backend.',
+    ER_BAD_DB_ERROR: 'Database yang dikonfigurasi tidak ditemukan.',
+    EADDRINUSE: 'Port HTTP backend sudah digunakan proses lain.',
+  };
+  return { ...info, reason: reasons[info.code] ?? (info.category === 'not_configured'
+    ? 'Variabel MySQL wajib belum lengkap.' : 'Pemeriksaan gagal; periksa kode error dan konfigurasi lokal.') };
 }
 
 export function getDatabaseErrorInfo(error) {

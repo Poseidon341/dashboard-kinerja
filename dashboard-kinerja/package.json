@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "appraisal:server": "node server/index.js",
-    "shadow:server": "node server/shadow.js",
+    "hosting": "node server/shadow.js",
+    "hosting:check": "node --env-file=.env scripts/hosting-check.mjs",
+    "shadow:server": "node --env-file=.env server/shadow.js",
     "db:health": "node server/db-health.js",
     "db:migrate": "node server/migrate.js",
     "db:import:dashboard": "node scripts/import-dashboard-data.mjs",

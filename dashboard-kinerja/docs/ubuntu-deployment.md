@@ -47,6 +47,29 @@ Set `MYSQL_*` sesuai target database **yang benar-benar tersedia**; isi allowlis
 
 ## 3. Jalankan backend sebagai service
 
+Backend memverifikasi allowlist konfigurasi serta `SELECT DATABASE(), @@port` sebelum membuka port HTTP. Kegagalan membuat startup berhenti dengan exit code 1 dan alasan aman, tanpa password. Pemeriksaan ini tidak menjalankan migration atau memvalidasi kelengkapan tabel/data.
+
+Untuk pengujian lokal dari direktori proyek (Node yang mendukung `--env-file`):
+
+```powershell
+npm.cmd run hosting:check
+npm.cmd run shadow:server
+```
+
+Kedua perintah tersebut secara eksplisit membaca `.env`. Development tetap memakai database `dashboard_funding_test` port `3308`. `npm run hosting` menjalankan backend dengan environment proses; pada production tidak memuat `.env` lokal.
+
+Pada Ubuntu gunakan `DASHBOARD_RUNTIME_ENV=production` di `/etc/dashboard-funding/backend.env`. `MYSQL_HOST/PORT/DATABASE` harus cocok dengan `DASHBOARD_PRODUCTION_DB_HOST/PORT/NAME`. Port `3306` hanya contoh bila itulah port server MySQL aktual; jangan mengganti port development secara global. Untuk preflight read-only memakai EnvironmentFile yang sama dengan service, tanpa menyalin rahasia ke terminal:
+
+```bash
+sudo systemd-run --wait --pipe --collect --unit=dashboard-funding-preflight \
+  --property=User=dashboardfunding --property=Group=dashboardfunding \
+  --property=WorkingDirectory=/opt/dashboard-funding/current \
+  --property=EnvironmentFile=/etc/dashboard-funding/backend.env \
+  /usr/bin/node /opt/dashboard-funding/current/scripts/hosting-check.mjs
+```
+
+Harapkan exit code 0 dan ringkasan `status: ok` beserta host, port, dan database yang disetujui. Unit backend tetap menjalankan Node langsung dengan `EnvironmentFile`, tanpa `--env-file=.env`. Jika pemeriksaan gagal, perbaiki konfigurasi/service MySQL terlebih dahulu; jangan melonggarkan allowlist.
+
 Tinjau [unit systemd](../deploy/dashboard-funding-api.service), khususnya `WorkingDirectory`, `ExecStart`, dan user. Setelah disetujui, pasang unit dan jalankan:
 
 ```bash
