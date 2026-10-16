@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
+import { scryptSync } from 'node:crypto';
 import { createShadowServer, SHADOW_TARGET } from '../server/shadow-master-api.mjs';
 import { getShadowPort } from '../server/shadow.js';
 
@@ -63,6 +64,44 @@ function isReadOnlySql(sql) {
   return /^(SELECT|WITH)\b/i.test(sql)
     && !/\b(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP|TRUNCATE)\b/i.test(sql);
 }
+
+test('production menolak endpoint data tanpa sesi server dan menerima sesi Admin yang valid', async () => {
+  const db = createFakeDatabase();
+  const salt = 'a'.repeat(32);
+  const env = {
+    DASHBOARD_RUNTIME_ENV: 'production', DASHBOARD_PUBLIC_ORIGIN: 'https://funding.example.com',
+    DASHBOARD_PRODUCTION_DB_HOST: SHADOW_TARGET.host,
+    DASHBOARD_PRODUCTION_DB_PORT: String(SHADOW_TARGET.port),
+    DASHBOARD_PRODUCTION_DB_NAME: SHADOW_TARGET.database,
+    DASHBOARD_ADMIN_USER: 'synthetic-admin',
+    DASHBOARD_ADMIN_PASSWORD_SCRYPT: `${salt}:${scryptSync('synthetic-secret', Buffer.from(salt, 'hex'), 32).toString('hex')}`,
+  };
+  await withServer({ getConfig: () => ({ ...SHADOW_TARGET }), getPool: () => db.pool, env }, async baseUrl => {
+    for (const path of ['/api/funding/master/rmft', '/api/appraisal/data?period=2026-05&type=RO',
+      '/api/funding/positions', '/api/shadow/master-rmft/summary']) {
+      const denied = await getJson(baseUrl, path);
+      assert.equal(denied.status, 401);
+      assert.equal(denied.body.error, 'data_auth_required');
+    }
+    assert.equal(db.connections, 0);
+    const login = await fetch(`${baseUrl}/api/admin/login`, {
+      method: 'POST', headers: { origin: env.DASHBOARD_PUBLIC_ORIGIN, 'content-type': 'application/json' },
+      body: JSON.stringify({ username: env.DASHBOARD_ADMIN_USER, password: 'synthetic-secret' }),
+    });
+    assert.equal(login.status, 200);
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    assert.match(login.headers.get('set-cookie'), /Path=\/api;/);
+    const authorized = await fetch(`${baseUrl}/api/shadow/master-rmft/summary`, { headers: { cookie } });
+    assert.equal(authorized.status, 200);
+    const logout = await fetch(`${baseUrl}/api/admin/logout`, {
+      method: 'POST', headers: { cookie, origin: env.DASHBOARD_PUBLIC_ORIGIN },
+    });
+    assert.equal(logout.status, 200);
+    const deniedAgain = await fetch(`${baseUrl}/api/shadow/master-rmft/summary`, { headers: { cookie } });
+    assert.equal(deniedAgain.status, 401);
+  });
+  assert.ok(db.statements.every(isReadOnlySql));
+});
 
 test('ringkasan shadow mengembalikan agregat aman dan menjalankan SELECT saja', async () => {
   const db = createFakeDatabase();

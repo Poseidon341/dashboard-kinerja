@@ -7,7 +7,7 @@ import {
 import { assertRkaTestTarget } from '../server/imports/mysql-rka-repository.mjs';
 import { readDashboardWorkbookSheet } from '../server/imports/dashboard-workbook-adapter.mjs';
 
-const workbookPath = new URL('../data/import/dashboard_funding.xlsx', import.meta.url);
+const workbookPath = process.env.DASHBOARD_TEST_WORKBOOK_PATH || new URL('../data/import/dashboard_funding.xlsx', import.meta.url);
 const recordsFrom = (bytes) => JSON.parse(bytes.toString('utf8'));
 const codesFromMaster = (records) => new Set(records.map((row) => String(row['BRANCH CODE'])));
 

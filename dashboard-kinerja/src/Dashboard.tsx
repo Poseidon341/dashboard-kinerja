@@ -11,6 +11,7 @@ import {
 import { AdminUpdateData } from './AdminUpdateData';
 import { getRkaValFromRow } from './rkaLookup';
 import { calculateCompleteDailyAverage } from './averageMetrics';
+import { EMPTY_POSITION_ROWS, activatePositionDataset, positionRowsForScope } from './positionDataset';
 import { createDetailOfficePlaceholder, getOfficeKcCode, getSourceOfficeType, matchesDetailOfficeScope, matchesDetailSourceScope, matchesSelectedOfficeType, normalizeOfficeType, resolveDetailOfficeType } from './detailUnitFilter.mjs';
 
 const namaBulanIndo = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
@@ -64,7 +65,7 @@ const formatCompactAmount = (value: number): string => {
 
 const formatExactAmount = (value: number): string => exactNumberFormatter.format(value);
 const formatFullAmount = (value: number): string => formatCompactAmount(value);
-const formatPrognosisMiliar = (value: number): string => `${formatTruncatedNumber(value)} M`;
+const formatPrognosisTriliun = (value: number): string => `${threeDecimalFormatter.format(value / 1000)} T`;
 const calculatePrognosisAchievement = (
   actualRupiah: number | null | undefined,
   prognosisMiliar: number | null | undefined,
@@ -360,10 +361,9 @@ export const Dashboard = () => {
   const [authStage, setAuthStage] = useState<AuthStage>('init');
   const [loadError, setLoadError] = useState('');
   const [dbRmft, setDbRmft] = useState<any[]>([]);
-  const [dbSegmen, setDbSegmen] = useState<any[]>([]);
+  const [positionDataset, setPositionDataset] = useState<{ scope: string; rows: any[] }>({ scope: '', rows: EMPTY_POSITION_ROWS });
   const [detailOfficeInventory, setDetailOfficeInventory] = useState<any[]>([]);
   const [detailInventoryLoaded, setDetailInventoryLoaded] = useState(false);
-  const loadedPositionScope = useRef('');
   const positionDataCache = useRef(new Map<string, any[]>());
   const detailOfficeInventoryCache = useRef<any[] | null>(null);
   const [dbRka, setDbRka] = useState<any[]>([]); 
@@ -376,8 +376,30 @@ export const Dashboard = () => {
   const [showProfile, setShowProfile] = useState(false); 
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const showSidebarLabels = isSidebarOpen || isMobileMenuOpen;
+
+  useEffect(() => {
+    if (!isMobileMenuOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsMobileMenuOpen(false);
+    };
+    const onResize = () => {
+      if (window.innerWidth >= 1024) setIsMobileMenuOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('resize', onResize);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [isMobileMenuOpen]);
 
   const [activeMenu, setActiveMenu] = useState('Dashboard Posisi Dana'); 
+  const desiredPositionScope = activeMenu === 'Detail Unit Kerja' ? 'mysql-detail' : 'mysql-position';
+  const dbSegmen = positionRowsForScope(positionDataset, desiredPositionScope);
   type FilterMenuKey = 'Dashboard Posisi Dana' | 'Dashboard Marginal' | 'Detail Unit Kerja' | 'Appraisal';
   type PageFilters = { area: string; cabang: string; unit: string; segmen: string; produk: string; periode: string };
   const initialPageFilters: PageFilters = {
@@ -551,9 +573,8 @@ export const Dashboard = () => {
   const handleAdminPublished = useCallback(() => {
     positionDataCache.current.clear();
     detailOfficeInventoryCache.current = null;
-    loadedPositionScope.current = '';
     engineDataCache.clear();
-    setDbSegmen([]);
+    setPositionDataset({ scope: '', rows: EMPTY_POSITION_ROWS });
     setPageFilters(previous => ({ ...previous,
       'Dashboard Posisi Dana': { ...previous['Dashboard Posisi Dana'], periode: initialPageFilters.periode },
     }));
@@ -562,16 +583,15 @@ export const Dashboard = () => {
 
   useEffect(() => {
     if ((authStage === 'fetching_data' || authStage === 'dashboard') && activeMenu !== 'Admin · Update Data') {
-      const scope = activeMenu === 'Detail Unit Kerja' ? 'mysql-detail' : 'mysql-position';
-      if (loadedPositionScope.current === scope && dbSegmen.length > 0) return;
+      const scope = desiredPositionScope;
+      if (positionDataset.scope === scope) return;
       const cachedData = positionDataCache.current.get(scope);
       if (cachedData) {
-        setDbSegmen(cachedData);
+        setPositionDataset(activatePositionDataset(scope, cachedData, engineDataCache));
         if (scope === 'mysql-detail') {
           setDetailOfficeInventory(detailOfficeInventoryCache.current || []);
           setDetailInventoryLoaded(Array.isArray(detailOfficeInventoryCache.current));
         }
-        loadedPositionScope.current = scope;
         if (authStage === 'fetching_data') setAuthStage('dashboard');
         return;
       }
@@ -643,19 +663,19 @@ export const Dashboard = () => {
           });
 
           if (!active) return;
-          setLatestPeriode(bestDate);
-          setPageFilters(previous => Object.fromEntries(
-            Object.entries(previous).map(([menu, filters]) => [menu, filters.periode === initialPageFilters.periode ? { ...filters, periode: bestDate } : filters])
-          ) as Record<FilterMenuKey, PageFilters>);
-          engineDataCache.clear();
-          setDbSegmen(cleanedData); 
+          if (scope === 'mysql-position') {
+            setLatestPeriode(bestDate);
+            setPageFilters(previous => Object.fromEntries(
+              Object.entries(previous).map(([menu, filters]) => [menu, filters.periode === initialPageFilters.periode ? { ...filters, periode: bestDate } : filters])
+            ) as Record<FilterMenuKey, PageFilters>);
+          }
+          setPositionDataset(activatePositionDataset(scope, cleanedData, engineDataCache));
           if (scope === 'mysql-detail') {
             detailOfficeInventoryCache.current = hasSourceOfficeInventory ? sourceOfficeInventory : null;
             setDetailOfficeInventory(sourceOfficeInventory);
             setDetailInventoryLoaded(hasSourceOfficeInventory);
           }
           positionDataCache.current.set(scope, cleanedData);
-          loadedPositionScope.current = scope;
           setLoadError('');
           if (authStage === 'fetching_data') setAuthStage('dashboard');
         })
@@ -667,7 +687,7 @@ export const Dashboard = () => {
         });
       return () => { active = false; };
     }
-  }, [authStage, activeMenu, dbSegmen.length]);
+  }, [authStage, activeMenu, desiredPositionScope, positionDataset.scope]);
 
   const profileName = useMemo(() => {
     if (!loggedInUser) return '';
@@ -1638,8 +1658,6 @@ export const Dashboard = () => {
       : [];
     return sortedDetailUnits([...children, ...kcpPlaceholders]);
   };
-  const unitsWithoutCode = useMemo(() => [...detailRkaByUnit.values()].filter(rka => !rka.kode).length, [detailRkaByUnit]);
-  const unitsWithoutTarget = useMemo(() => [...detailRkaByUnit.values()].filter(rka => rka.monthly === null || rka.december === null).length, [detailRkaByUnit]);
   const detailMasterTypeCount = selectedUnit === 'ALL' ? null : new Set([
     ...dbUkerList.flatMap((office) => {
       const code = String(office?.['BRANCH CODE'] ?? '').trim();
@@ -1965,7 +1983,7 @@ export const Dashboard = () => {
     </div>
   );
 
-  const StatCardV2 = ({ title, icon: Icon, themeCode, textCode, dataVal, comparisonPosition, rkaVal, rkaStatus, rkaComplete = true, rkaComparedUnits = 0, rkaTargetUnits = 0, rkaTotalUnits = 0, averagePositionCoverage, averageTargetCoverage, averagePositionStatus, progVal, progStatus, progIsTarget = false, showPrognosis = false, isAverageMode, dtd, mtd, mtm, ytd, onClick }: any) => {
+  const StatCardV2 = ({ title, icon: Icon, themeCode, textCode, dataVal, comparisonPosition, rkaVal, rkaStatus, rkaComplete = true, rkaComparedUnits = 0, rkaTargetUnits = 0, rkaTotalUnits = 0, averagePositionCoverage, averageTargetCoverage, averagePositionStatus, progVal, progStatus, progIsTarget = false, showPrognosis = false, isAverageMode, dtd, mtd, ytd, onClick }: any) => {
     const hasData = typeof dataVal === 'number' && Number.isFinite(dataVal);
     const hasRkaValue = typeof rkaVal === 'number' && Number.isFinite(rkaVal);
     const hasComparisonPosition = typeof comparisonPosition === 'number' && Number.isFinite(comparisonPosition);
@@ -1993,8 +2011,7 @@ export const Dashboard = () => {
         : !hasData ? 'Posisi aktual untuk periode ini belum tersedia.'
         : label === 'DTD' ? 'Snapshot hari sebelumnya tidak tersedia.'
         : label === 'MTD' ? 'Snapshot akhir bulan sebelumnya tidak tersedia.'
-        : label === 'YTD' ? 'Snapshot akhir Desember 2025 tidak tersedia.'
-        : 'Nilai MTM belum dihitung oleh model saat ini.';
+        : 'Snapshot akhir Desember 2025 tidak tersedia.';
       return (
         <div className="flex flex-col items-center justify-center py-1.5 px-0.5" title={!hasValue ? unavailableReason : undefined} aria-label={!hasValue ? `${label}: ${unavailableReason}` : undefined}>
           <span className="text-[9px] text-slate-500 font-semibold mb-0.5" title={isAverageMode ? `Perubahan posisi snapshot ${label}` : undefined}>{label}</span>
@@ -2053,7 +2070,7 @@ export const Dashboard = () => {
           <div className="rounded-xl border border-slate-200 grid grid-cols-2 divide-x divide-slate-200 p-2 bg-slate-50/60">
             <div className="min-w-0 flex flex-col items-center justify-center px-1">
               <span className="text-[9px] text-slate-500 font-semibold mb-0.5">Prognosa Oktober</span>
-              <span className="text-sm font-extrabold text-slate-700 tracking-tight leading-tight break-words" title={hasProg ? 'M = miliar rupiah; nilai sumber ditampilkan tanpa konversi.' : progStatus}>{hasProg ? formatPrognosisMiliar(progVal) : '—'}</span>
+              <span className="text-sm font-extrabold text-slate-700 tracking-tight leading-tight break-words" title={hasProg ? 'T = triliun rupiah; nilai sumber miliar dibagi 1.000 untuk tampilan.' : progStatus}>{hasProg ? formatPrognosisTriliun(progVal) : '—'}</span>
             </div>
             <div className="min-w-0 flex flex-col items-center justify-center px-1">
               <span className="text-[9px] text-slate-500 font-semibold mb-0.5">% Penc. Prognosa</span>
@@ -2064,10 +2081,9 @@ export const Dashboard = () => {
           {!hasProg && <p className="text-[9px] text-slate-500 mt-1 text-center">Data Prognosa Oktober belum tersedia</p>}
         </div>}
 
-        <div className={`grid ${isAverageMode ? 'grid-cols-3' : 'grid-cols-4'} divide-x divide-slate-200 bg-slate-50/70 mt-auto`}>
+        <div className="grid grid-cols-3 divide-x divide-slate-200 bg-slate-50/70 mt-auto">
           {formatBawah('DTD', dtd)}
           {formatBawah('MTD', mtd)}
-          {!isAverageMode && formatBawah('MTM', mtm)}
           {formatBawah('YTD', ytd)}
         </div>
       </div>
@@ -2119,7 +2135,7 @@ export const Dashboard = () => {
           </div>
           
           <div className="grid w-full min-w-0 grid-cols-2 gap-2 sm:grid-cols-4 lg:flex lg:w-auto lg:flex-wrap">
-            <button onClick={() => setSelectedSegmen('Non-Wholesale (Ritel & Mikro)')} className={`min-h-10 min-w-0 rounded-lg border px-2 py-2 text-center text-[9px] leading-tight font-bold transition-colors sm:text-[10px] lg:whitespace-nowrap lg:px-4 lg:py-1.5 ${selectedSegmen.includes('Non-Wholesale') ? 'bg-[#004a8c] text-white border-[#004a8c]' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>NON WHOLESALE (RITEL + MIKRO)</button>
+            <button onClick={() => setSelectedSegmen('Non-Wholesale (Ritel & Mikro)')} className={`min-h-10 min-w-0 rounded-lg border px-2 py-2 text-center text-[9px] leading-tight font-bold transition-colors sm:text-[10px] lg:whitespace-nowrap lg:px-4 lg:py-1.5 ${selectedSegmen.includes('Non-Wholesale') ? 'bg-[#004a8c] text-white border-[#004a8c]' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>NON WHOLESALE</button>
             <button onClick={() => setSelectedSegmen('Ritel')} className={`min-h-10 min-w-0 rounded-lg border px-2 py-2 text-center text-[9px] leading-tight font-bold transition-colors sm:text-[10px] lg:whitespace-nowrap lg:px-4 lg:py-1.5 ${selectedSegmen === 'Ritel' ? 'bg-[#004a8c] text-white border-[#004a8c]' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>RITEL</button>
             <button onClick={() => setSelectedSegmen('Mikro')} className={`min-h-10 min-w-0 rounded-lg border px-2 py-2 text-center text-[9px] leading-tight font-bold transition-colors sm:text-[10px] lg:whitespace-nowrap lg:px-4 lg:py-1.5 ${selectedSegmen === 'Mikro' ? 'bg-[#004a8c] text-white border-[#004a8c]' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>MIKRO</button>
             <button onClick={() => setSelectedSegmen('Wholesale')} className={`min-h-10 min-w-0 rounded-lg border px-2 py-2 text-center text-[9px] leading-tight font-bold transition-colors sm:text-[10px] lg:whitespace-nowrap lg:px-4 lg:py-1.5 ${selectedSegmen === 'Wholesale' ? 'bg-[#004a8c] text-white border-[#004a8c]' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>WHOLESALE</button>
@@ -2133,25 +2149,25 @@ export const Dashboard = () => {
             title="TOTAL DPK" icon={LayoutDashboard} 
             themeCode="#0f172a" textCode="#0f172a" 
             dataVal={engineData.stats.dpk.val} comparisonPosition={rkaDpkResult.position} rkaVal={rkaDpk} rkaComplete={rkaDpkResult.complete} rkaComparedUnits={rkaDpkResult.available} rkaTotalUnits={rkaDpkResult.total} rkaStatus={rkaDpkResult.reason} rkaDiagnostics={rkaDpkResult.diagnostics} progVal={prognosisValues.dpk} progStatus={prognosisStatus} progIsTarget={true} showPrognosis={true} isAverageMode={false} 
-            dtd={engineData.stats.dpk.dtd} mtd={engineData.stats.dpk.mtd} mtm={engineData.stats.dpk.mtm} ytd={engineData.stats.dpk.ytd}
+            dtd={engineData.stats.dpk.dtd} mtd={engineData.stats.dpk.mtd} ytd={engineData.stats.dpk.ytd}
           />
           <StatCardV2 
             title="TABUNGAN" icon={Wallet} 
             themeCode="#004a8c" textCode="#004a8c" 
             dataVal={engineData.stats.tabungan.val} comparisonPosition={rkaTabResult.position} rkaVal={rkaTab} rkaComplete={rkaTabResult.complete} rkaComparedUnits={rkaTabResult.available} rkaTotalUnits={rkaTabResult.total} rkaStatus={rkaTabResult.reason} rkaDiagnostics={rkaTabResult.diagnostics} progVal={prognosisValues.tabungan} progStatus={prognosisStatus} progIsTarget={true} showPrognosis={true} isAverageMode={false} 
-            dtd={engineData.stats.tabungan.dtd} mtd={engineData.stats.tabungan.mtd} mtm={engineData.stats.tabungan.mtm} ytd={engineData.stats.tabungan.ytd}
+            dtd={engineData.stats.tabungan.dtd} mtd={engineData.stats.tabungan.mtd} ytd={engineData.stats.tabungan.ytd}
           />
           <StatCardV2 
             title="DEPOSITO" icon={Banknote} 
             themeCode="#0f8b65" textCode="#0f8b65" 
             dataVal={engineData.stats.deposito.val} comparisonPosition={rkaDepResult.position} rkaVal={rkaDep} rkaComplete={rkaDepResult.complete} rkaComparedUnits={rkaDepResult.available} rkaTotalUnits={rkaDepResult.total} rkaStatus={rkaDepResult.reason} rkaDiagnostics={rkaDepResult.diagnostics} progVal={prognosisValues.deposito} progStatus={prognosisStatus} progIsTarget={true} showPrognosis={true} isAverageMode={false} 
-            dtd={engineData.stats.deposito.dtd} mtd={engineData.stats.deposito.mtd} mtm={engineData.stats.deposito.mtm} ytd={engineData.stats.deposito.ytd}
+            dtd={engineData.stats.deposito.dtd} mtd={engineData.stats.deposito.mtd} ytd={engineData.stats.deposito.ytd}
           />
           <StatCardV2 
             title="GIRO" icon={PieChart} 
             themeCode="#8b5cf6" textCode="#8b5cf6" 
             dataVal={engineData.stats.giro.val} comparisonPosition={rkaGirResult.position} rkaVal={rkaGir} rkaComplete={rkaGirResult.complete} rkaComparedUnits={rkaGirResult.available} rkaTotalUnits={rkaGirResult.total} rkaStatus={rkaGirResult.reason} rkaDiagnostics={rkaGirResult.diagnostics} progVal={prognosisValues.giro} progStatus={prognosisStatus} progIsTarget={true} showPrognosis={true} isAverageMode={false} 
-            dtd={engineData.stats.giro.dtd} mtd={engineData.stats.giro.mtd} mtm={engineData.stats.giro.mtm} ytd={engineData.stats.giro.ytd}
+            dtd={engineData.stats.giro.dtd} mtd={engineData.stats.giro.mtd} ytd={engineData.stats.giro.ytd}
           />
         </div>
         <div className="min-w-0 bg-white p-4 sm:p-5 rounded-2xl shadow-sm border border-slate-300 mb-6">
@@ -2563,21 +2579,6 @@ const renderDetailUnitKerja = () => {
 
         {renderFilterBar()}
 
-        {(unitsWithoutCode > 0 || unitsWithoutTarget > 0) && (
-          <div className="mb-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-[11px] font-semibold text-amber-800 flex items-center gap-2">
-            <Info size={14} className="shrink-0" />
-            {unitsWithoutCode} unit tanpa kode terverifikasi; {unitsWithoutTarget} unit tanpa target RKA lengkap terverifikasi. Rekap KC kosong jika seluruh unit dalam cakupan tidak memiliki nilai valid.
-          </div>
-        )}
-        <p className="mb-3 rounded-lg border border-slate-200 bg-white/80 px-3 py-2 text-[10px] leading-relaxed text-slate-500">
-          Baris KC merangkum setiap kantor sumber unik dalam cakupan sekali. Master menyediakan relasi KCP dan UNIT langsung ke KC, tetapi tidak menyediakan relasi induk KCP untuk UNIT; karena itu KCP dan UNIT ditampilkan sebagai baris turunan KC tanpa mengarang pengelompokan di antaranya.
-        </p>
-        <p className="mb-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-[10px] leading-relaxed text-blue-900">
-          Nilai pada tabel ini khusus TABUNGAN (MIKRO). {detailInventoryLoaded
-            ? 'Filter tipe memakai awalan KC/KCP/KK/UNIT pada Nama Uker sumber bila tersedia; jika berbeda dari tipe master, baris ditampilkan terpisah tanpa relasi induk atau target RKA.'
-            : 'Backend yang sedang berjalan belum mengirim inventaris klasifikasi sumber; filter sementara memakai tipe master. Restart backend untuk mengaktifkan klasifikasi KC/KCP/KK dari sumber posisi.'} Placeholder bertanda abu-abu berarti record TABUNGAN (MIKRO) tidak tersedia untuk kantor/periode tersebut.
-        </p>
-
         <div className="min-w-0 bg-white rounded-xl border border-slate-300 shadow-sm mb-4 overflow-x-auto text-[10px]">
           <div className="min-w-0 p-3 border-b border-slate-300 flex flex-col gap-3 bg-slate-50 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex w-fit max-w-full border-2 border-black font-bold uppercase tracking-widest text-center text-[10px]">
@@ -2824,7 +2825,7 @@ const renderDetailUnitKerja = () => {
                 title="KINERJA TABUNGAN MIKRO" icon={Wallet} 
                 themeCode="#004a8c" textCode="#004a8c" 
                 dataVal={modalPosition} comparisonPosition={modalPosition} rkaVal={modalRkaResult.value} rkaComplete={modalPosition !== null && modalRkaResult.value !== null} rkaComparedUnits={modalPosition !== null && modalRkaResult.value !== null ? 1 : 0} rkaTotalUnits={1} rkaStatus={modalRkaResult.reason || (modalPosition === null ? 'Posisi Tabungan unit tidak tersedia pada snapshot kategori terpilih.' : null)} progVal={null} progStatus={prognosisStatus} isAverageMode={false} 
-                dtd={selectedUkerModal.dtd_diff} mtd={selectedUkerModal.mtd_diff} mtm={null} ytd={selectedUkerModal.ytd_diff}
+                dtd={selectedUkerModal.dtd_diff} mtd={selectedUkerModal.mtd_diff} ytd={selectedUkerModal.ytd_diff}
               />
               <div className="bg-white p-5 rounded-2xl border border-slate-200/90 shadow-sm flex flex-col">
                 <h3 className="text-xs font-black uppercase tracking-widest text-slate-800 mb-2 border-b border-slate-100 pb-2 text-center">Trend Posisi Uker</h3>
@@ -2838,21 +2839,25 @@ const renderDetailUnitKerja = () => {
       )}
 
       {isMobileMenuOpen && <button type="button" aria-label="Tutup menu navigasi" onClick={() => setIsMobileMenuOpen(false)} className="fixed inset-0 z-40 bg-slate-950/30 lg:hidden" />}
-      <div className={`fixed lg:relative inset-y-3 left-3 z-50 flex flex-col h-[calc(100dvh-1.5rem)] bg-[#0b2347] border border-[#17385f] rounded-[1.35rem] transition-all duration-300 shadow-[0_18px_44px_-18px_rgba(8,28,58,0.48)] ${isMobileMenuOpen ? 'translate-x-0 w-64' : '-translate-x-[120%] lg:translate-x-0'} ${isSidebarOpen ? 'lg:w-64' : 'lg:w-[5.25rem]'}`}>
+      {isMobileMenuOpen && <button type="button" onClick={() => setIsMobileMenuOpen(false)} aria-label="Tutup menu lewat hamburger" aria-expanded={true} aria-controls="dashboard-sidebar" className="fixed right-3 top-4 z-[60] rounded-lg border border-slate-200 bg-white p-2 text-slate-600 shadow-sm lg:hidden"><X size={18}/></button>}
+      <div id="dashboard-sidebar" className={`fixed lg:relative inset-y-3 left-3 z-50 flex w-64 flex-col h-[calc(100dvh-1.5rem)] bg-[#0b2347] border border-[#17385f] rounded-[1.35rem] transition-transform duration-300 lg:transition-[width] shadow-[0_18px_44px_-18px_rgba(8,28,58,0.48)] ${isMobileMenuOpen ? 'translate-x-0 pointer-events-auto' : '-translate-x-[120%] pointer-events-none lg:translate-x-0 lg:pointer-events-auto'} ${isSidebarOpen ? 'lg:w-64' : 'lg:w-[5.25rem]'}`}>
         <div className="w-full flex flex-col h-full overflow-hidden">
-          <div className="p-4 flex items-center justify-between border-b border-white/10">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#1689e8] to-[#1760a8] flex items-center justify-center text-white shadow-md shadow-black/20 ring-1 ring-white/15">
+          <div className={`p-4 flex items-center justify-between gap-2 border-b border-white/10 ${!isSidebarOpen ? 'lg:flex-col lg:p-2' : ''}`}>
+            <div className="flex min-w-0 items-center gap-2">
+              <div className="w-10 h-10 shrink-0 rounded-xl bg-gradient-to-br from-[#1689e8] to-[#1760a8] flex items-center justify-center text-white shadow-md shadow-black/20 ring-1 ring-white/15">
                 <Landmark size={20} strokeWidth={2.5} />
               </div>
-              {isSidebarOpen && (
-                <div>
-                  <h1 className="text-white text-[12px] font-extrabold tracking-[0.025em]">DASHBOARD FUNDING</h1>
-                  <p className="mt-1 max-w-[158px] text-[8px] font-medium leading-[1.35] text-blue-100/70">Monitoring Kinerja dan Pencapaian RMFT</p>
+              {showSidebarLabels && (
+                <div className="min-w-0">
+                  <h1 className="truncate text-white text-[12px] font-extrabold tracking-[0.025em]">DASHBOARD FUNDING</h1>
+                  <p className="mt-1 truncate text-[8px] font-medium leading-[1.35] text-blue-100/70">Monitoring Kinerja dan Pencapaian RMFT</p>
                 </div>
               )}
             </div>
-              <button type="button" onClick={() => setIsSidebarOpen(open => !open)} aria-label={isSidebarOpen ? 'Ciutkan sidebar' : 'Perluas sidebar'} className="p-1.5 rounded-lg text-blue-100/70 hover:bg-white/10 hover:text-white transition-colors">
+            <button type="button" onClick={() => setIsMobileMenuOpen(false)} aria-label="Tutup sidebar" className="shrink-0 p-1.5 rounded-lg text-blue-100/70 hover:bg-white/10 hover:text-white transition-colors lg:hidden">
+              <ChevronLeft size={16} />
+            </button>
+            <button type="button" onClick={() => setIsSidebarOpen(open => !open)} aria-label={isSidebarOpen ? 'Ciutkan sidebar' : 'Perluas sidebar'} className="hidden shrink-0 p-1.5 rounded-lg text-blue-100/70 hover:bg-white/10 hover:text-white transition-colors lg:inline-flex">
               <ChevronLeft size={16} className={isSidebarOpen ? '' : 'rotate-180'} />
             </button>
           </div>
@@ -2861,15 +2866,15 @@ const renderDetailUnitKerja = () => {
             {MENU_ITEMS.map((item) => {
               const active = activeMenu === item.name;
               return (
-                <button key={item.name} onClick={() => { setActiveMenu(item.name); setIsMobileMenuOpen(false); }} className={`w-full flex items-center px-3.5 py-3 rounded-xl text-xs transition-all cursor-pointer font-semibold ${active ? 'bg-blue-400/15 text-white shadow-[inset_3px_0_0_#38bdf8]' : 'text-blue-100/75 hover:bg-white/[0.06] hover:text-white'}`}>
-                  <item.icon size={18} strokeWidth={active ? 2.5 : 2} className={active ? 'text-sky-300' : 'text-blue-200/60'} />
-                  {isSidebarOpen && <span className="ml-3">{item.name}</span>}
+                <button key={item.name} onClick={() => { setActiveMenu(item.name); setIsMobileMenuOpen(false); }} className={`w-full min-w-0 flex items-center px-3.5 py-3 rounded-xl text-xs transition-all cursor-pointer font-semibold ${active ? 'bg-blue-400/15 text-white shadow-[inset_3px_0_0_#38bdf8]' : 'text-blue-100/75 hover:bg-white/[0.06] hover:text-white'}`}>
+                  <item.icon size={18} strokeWidth={active ? 2.5 : 2} className={`shrink-0 ${active ? 'text-sky-300' : 'text-blue-200/60'}`} />
+                  {showSidebarLabels && <span className="ml-3 min-w-0 truncate">{item.name}</span>}
                 </button>
               );
             })}
           </div>
 
-          {isSidebarOpen && (
+          {showSidebarLabels && (
             <div className="p-3 m-2 rounded-2xl bg-white/[0.06] border border-white/10">
               <button type="button" onClick={() => setShowProfile(open => !open)} aria-expanded={showProfile} className="w-full flex items-center gap-3 mb-3 text-left">
                 <div className="w-8 h-8 rounded-full bg-gradient-to-br from-sky-500 to-blue-700 text-white flex items-center justify-center font-bold text-xs ring-1 ring-white/20">
@@ -2889,14 +2894,19 @@ const renderDetailUnitKerja = () => {
       
       <div className="flex-1 min-w-0 flex flex-col h-full overflow-hidden relative">
         <div className="min-h-[4.25rem] flex shrink-0 items-center gap-1.5 border-b border-slate-200/80 bg-white/85 px-3 py-2 backdrop-blur-sm sm:gap-2 sm:px-7">
-          <button onClick={() => setIsMobileMenuOpen(true)} aria-label="Buka menu navigasi" className="lg:hidden shrink-0 p-2 bg-white rounded-lg border border-slate-200 mr-1 sm:mr-2 text-slate-600 cursor-pointer shadow-sm"><Menu size={18}/></button>
+          <button type="button" onClick={() => setIsMobileMenuOpen(true)} aria-label="Buka menu navigasi" aria-expanded={isMobileMenuOpen} aria-controls="dashboard-sidebar" className="mr-1 shrink-0 cursor-pointer rounded-lg border border-slate-200 bg-white p-2 text-slate-600 shadow-sm sm:mr-2 lg:hidden"><Menu size={18}/></button>
           <div className="min-w-0 flex-1"><span className="block text-[9px] sm:text-[10px] font-extrabold uppercase tracking-[0.12em] sm:tracking-[0.14em] text-blue-700">DASHBOARD FUNDING</span><span className="mt-0.5 block truncate text-[8px] sm:text-[9px] leading-3 text-slate-500">Monitoring Kinerja dan Pencapaian RMFT</span><span className="mt-0.5 block truncate text-xs sm:text-sm font-semibold text-slate-800">{activeMenu}</span></div>
         </div>
 
-        <div className="dashboard-canvas flex-1 min-w-0 overflow-y-auto p-3 sm:p-5 lg:p-7 pb-20 lg:pb-7 scrollbar-hide">
-          {activeMenu === 'Dashboard Posisi Dana' && renderDashboardPosisi()}
-          {activeMenu === 'Dashboard Marginal' && renderDashboardMarginal()}
-          {activeMenu === 'Detail Unit Kerja' && renderDetailUnitKerja()}
+        <div className={`dashboard-canvas flex-1 min-w-0 p-3 sm:p-5 lg:p-7 pb-20 lg:pb-7 scrollbar-hide ${isMobileMenuOpen ? 'overflow-y-hidden lg:overflow-y-auto' : 'overflow-y-auto'}`}>
+          {(activeMenu === 'Dashboard Posisi Dana' || activeMenu === 'Dashboard Marginal' || activeMenu === 'Detail Unit Kerja')
+            && positionDataset.scope !== desiredPositionScope &&
+            <div role="status" className="flex min-h-40 items-center justify-center gap-2 text-sm text-slate-600">
+              <Loader2 size={18} className="animate-spin" /> Memuat data posisi dari MySQL…
+            </div>}
+          {activeMenu === 'Dashboard Posisi Dana' && positionDataset.scope === desiredPositionScope && renderDashboardPosisi()}
+          {activeMenu === 'Dashboard Marginal' && positionDataset.scope === desiredPositionScope && renderDashboardMarginal()}
+          {activeMenu === 'Detail Unit Kerja' && positionDataset.scope === desiredPositionScope && renderDetailUnitKerja()}
           {activeMenu === 'Appraisal' && renderDashboardAppraisal()}
           {activeMenu === 'Admin · Update Data' && <AdminUpdateData onPublished={handleAdminPublished} />}
         </div>

@@ -10,7 +10,7 @@ import {
 import { assertExpectedImportTarget } from '../server/imports/mysql-uker-repository.mjs';
 import { readDashboardWorkbookSheet } from '../server/imports/dashboard-workbook-adapter.mjs';
 
-const workbookPath = new URL('../data/import/dashboard_funding.xlsx', import.meta.url);
+const workbookPath = process.env.DASHBOARD_TEST_WORKBOOK_PATH || new URL('../data/import/dashboard_funding.xlsx', import.meta.url);
 const [rmftWorkbook, officeWorkbook] = await Promise.all([
   readDashboardWorkbookSheet(workbookPath, 'rmft_list', { expectedHeaders: ['PN', 'Nama', 'JG', 'Jabatan', 'Kode Uker'] }),
   readDashboardWorkbookSheet(workbookPath, 'uker_list', { expectedHeaders: ['BRANCH CODE'] }),

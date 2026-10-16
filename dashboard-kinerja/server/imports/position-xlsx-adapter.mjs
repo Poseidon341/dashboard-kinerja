@@ -1,175 +1,240 @@
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { createWriteStream } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, posix, resolve } from 'node:path';
 import { once } from 'node:events';
-import { createInterface } from 'node:readline';
+import { StringDecoder } from 'node:string_decoder';
+import yauzl from 'yauzl';
+import { SaxesParser } from 'saxes';
 
 const REQUIRED_HEADERS = Object.freeze([
   'Posisi', 'Segmentasi BPR', 'Produk', 'Nama Cabang', 'Nama Uker', 'Jumlah Rekening', 'Saldo',
 ]);
+const local = (name) => name.slice(name.lastIndexOf(':') + 1);
 
-// Worksheet XML is consumed row by row with XmlReader. A compact temporary JSON
-// array lets the existing position validator retain exact JSON numeric tokens;
-// neither the workbook rows nor the generated file are loaded into memory whole.
-const POWERSHELL = String.raw`
-$ErrorActionPreference = 'Stop'
-$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$zip = [IO.Compression.ZipFile]::OpenRead($env:POSITION_XLSX_PATH)
-function Read-SmallEntry([string]$name) {
-  $entry = $zip.GetEntry($name); if (-not $entry) { throw 'Workbook component missing.' }
-  $reader = [IO.StreamReader]::new($entry.Open())
-  try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
-}
-function Column-Number([string]$reference) {
-  $letters = [regex]::Match($reference, '^[A-Z]+').Value; $n = 0
-  foreach ($letter in $letters.ToCharArray()) { $n = $n * 26 + ([int]$letter - [int][char]'A' + 1) }
-  return $n
-}
-function Json-String([string]$value) { return (ConvertTo-Json -InputObject $value -Compress) }
-function Read-Cell($rowReader, $strings, $dateStyles) {
-  $cellReader = $rowReader.ReadSubtree(); $null = $cellReader.Read()
-  $column = Column-Number $cellReader.GetAttribute('r'); $type = $cellReader.GetAttribute('t')
-  $styleText = $cellReader.GetAttribute('s'); $style = if ($styleText) { [int]$styleText } else { 0 }
-  $raw = $null; $inline = [System.Text.StringBuilder]::new(); $formula = $false
-  try {
-    while ($cellReader.Read()) {
-      if ($cellReader.NodeType -ne [Xml.XmlNodeType]::Element) { continue }
-      if ($cellReader.LocalName -eq 'f') { $formula = $true }
-      elseif ($cellReader.LocalName -eq 'v') { $raw = $cellReader.ReadElementContentAsString() }
-      elseif ($cellReader.LocalName -eq 't' -and $type -eq 'inlineStr') { [void]$inline.Append($cellReader.ReadElementContentAsString()) }
-    }
-  } finally { $cellReader.Dispose() }
-  if ($type -eq 'e') { throw 'Workbook contains a stored cell error.' }
-  if ($formula -and [string]::IsNullOrWhiteSpace($raw)) { throw 'Workbook formula cache is missing.' }
-  $token = 'null'
-  if ($type -eq 'inlineStr') { $token = Json-String $inline.ToString() }
-  elseif (-not [string]::IsNullOrEmpty($raw)) {
-    if ($type -eq 's') { $i=[int]$raw; if ($i -lt 0 -or $i -ge $strings.Count) { throw 'Shared string index invalid.' }; $token=Json-String ([string]$strings[$i]) }
-    elseif ($type -eq 'str' -or $type -eq 'd') { $token=Json-String $raw }
-    elseif ($type -eq 'b') { if ($raw -eq '1') {$token='true'} elseif ($raw -eq '0') {$token='false'} else {throw 'Boolean cell token invalid.'} }
-    else { if ($raw -notmatch '^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[Ee][+-]?\d+)?$') { throw 'Numeric cell token invalid.' }; $token=$raw }
-  }
-  return @{ column=$column; type=$type; style=$style; token=$token; isDate=(($type -notin @('s','inlineStr','str','d')) -and $dateStyles.ContainsKey($style) -and $dateStyles[$style]) }
-}
-try {
-  [xml]$workbook = Read-SmallEntry 'xl/workbook.xml'; [xml]$relationships = Read-SmallEntry 'xl/_rels/workbook.xml.rels'
-  $wNs = [Xml.XmlNamespaceManager]::new($workbook.NameTable); $wNs.AddNamespace('m','http://schemas.openxmlformats.org/spreadsheetml/2006/main')
-  $rNs = [Xml.XmlNamespaceManager]::new($relationships.NameTable); $rNs.AddNamespace('r','http://schemas.openxmlformats.org/package/2006/relationships')
-  $targets = @{}; foreach ($rel in $relationships.SelectNodes('//r:Relationship',$rNs)) { $targets[$rel.Id] = $rel.Target }
-  $wanted = $null
-  foreach ($node in $workbook.SelectNodes('//m:sheets/m:sheet',$wNs)) { if ($node.name -ceq 'segmen_data') { $wanted = $node; break } }
-  if (-not $wanted) { throw 'Worksheet segmen_data not found.' }
-  $rid = $wanted.GetAttribute('id','http://schemas.openxmlformats.org/officeDocument/2006/relationships'); $target = $targets[$rid]
-  if (-not $target) { throw 'Worksheet relationship invalid.' }
-  $entryName = if ($target.StartsWith('/')) { $target.TrimStart('/') } elseif ($target.StartsWith('xl/')) { $target } else { "xl/$target" }
-  $strings = [System.Collections.Generic.List[string]]::new()
-  if ($zip.GetEntry('xl/sharedStrings.xml')) {
-    $sharedStream=$zip.GetEntry('xl/sharedStrings.xml').Open(); $ssReader=[Xml.XmlReader]::Create($sharedStream,[Xml.XmlReaderSettings]::new())
-    $pool=[System.Collections.Generic.List[string]]::new(); $indices=[System.Collections.Generic.List[int]]::new(); $lookup=[System.Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
-    try {
-      $null=$ssReader.Read()
-      while (-not $ssReader.EOF) {
-        if ($ssReader.NodeType -ne [Xml.XmlNodeType]::Element -or $ssReader.LocalName -ne 'si') { $null=$ssReader.Read(); continue }
-        $itemReader=$ssReader.ReadSubtree(); $null=$itemReader.Read(); $text=[System.Text.StringBuilder]::new()
-        try { while($itemReader.Read()) { if($itemReader.NodeType -eq [Xml.XmlNodeType]::Element -and $itemReader.LocalName -eq 't') { [void]$text.Append($itemReader.ReadElementContentAsString()) } } }
-        finally { $itemReader.Dispose() }
-        $value=$text.ToString(); $poolIndex=0
-        if (-not $lookup.TryGetValue($value,[ref]$poolIndex)) { $poolIndex=$pool.Count; $lookup.Add($value,$poolIndex); $pool.Add($value) }
-        $indices.Add($poolIndex); $null=$ssReader.Read()
-      }
-      foreach ($index in $indices) { $strings.Add($pool[$index]) }
-    } finally { $ssReader.Dispose(); $sharedStream.Dispose() }
-  }
-  $dateStyles = @{}
-  if ($zip.GetEntry('xl/styles.xml')) {
-    [xml]$styles = Read-SmallEntry 'xl/styles.xml'
-    $styleRows = $styles.SelectNodes("//*[local-name()='cellXfs']/*[local-name()='xf']")
-    $customFormats = @{}
-    foreach ($format in $styles.SelectNodes("//*[local-name()='numFmt']")) { $customFormats[[int]$format.GetAttribute('numFmtId')] = [string]$format.GetAttribute('formatCode') }
-    for ($i = 0; $i -lt $styleRows.Count; $i++) {
-      $formatId = [int]$styleRows[$i].GetAttribute('numFmtId'); $formatCode = [string]$customFormats[$formatId]
-      $dateStyles[$i] = (($formatId -ge 14 -and $formatId -le 22) -or ($formatCode -match '(?i)(^|[^\\])[dmy]'))
-    }
-  }
-  $workbookProperties = $workbook.SelectSingleNode("//*[local-name()='workbookPr']")
-  $date1904 = $workbookProperties -and $workbookProperties.GetAttribute('date1904') -in @('1','true')
-  $sheetEntry = $zip.GetEntry($entryName); if (-not $sheetEntry) { throw 'Worksheet data missing.' }
-  $stream = $sheetEntry.Open(); $settings = [Xml.XmlReaderSettings]::new(); $settings.IgnoreWhitespace = $true
-  $reader = [Xml.XmlReader]::Create($stream,$settings)
-  $headers = @{}; $maxColumn = 0; $rowCount = 0; $limit = [int]$env:POSITION_XLSX_LIMIT
-  $outputBatch = [System.Collections.Generic.List[string]]::new()
-  try {
-    $null = $reader.Read()
-    while (-not $reader.EOF) {
-      if ($reader.NodeType -ne [Xml.XmlNodeType]::Element -or $reader.LocalName -ne 'row') { $null = $reader.Read(); continue }
-      $physicalRow = [int]$reader.GetAttribute('r'); $rowReader=$reader.ReadSubtree(); $null=$rowReader.Read(); $cells=@{}
-      try { while($rowReader.Read()) { if($rowReader.NodeType -eq [Xml.XmlNodeType]::Element -and $rowReader.LocalName -eq 'c') { $cell=Read-Cell $rowReader $strings $dateStyles; $cells[$cell.column]=$cell } } }
-      finally { $rowReader.Dispose() }
-      if ($physicalRow -eq 1) {
-        foreach ($key in $cells.Keys) {
-          $token = $cells[$key].token
-          if ($token -eq 'null') { continue }
-          $header = [string](ConvertFrom-Json -InputObject $token)
-          if (-not [string]::IsNullOrWhiteSpace($header)) { $headers[[int]$key] = $header; if ([int]$key -gt $maxColumn) { $maxColumn = [int]$key } }
-        }
-        $missing = @($env:POSITION_XLSX_EXPECTED_HEADERS -split [char]31 | Where-Object { $_ -notin $headers.Values })
-        if ($missing.Count) { throw ('Required worksheet headers missing: ' + [string]::Join(', ',$missing)) }
-        $null=$reader.Read()
-        continue
-      }
-      if ($physicalRow -lt 2) { $null=$reader.Read(); continue }
-      $parts = [System.Collections.Generic.List[string]]::new(); $hasValue = $false
-      for ($column = 1; $column -le $maxColumn; $column++) {
-        $header = $headers[$column]
-        if (-not $header) { throw 'Worksheet header has an unnamed interior column.' }
-        $token = if ($cells.ContainsKey($column)) { $cells[$column].token } else { 'null' }
-        if ($token -ne 'null' -and $token -ne '""') { $hasValue = $true }
-        $parts.Add((Json-String $header) + ':' + $token)
-      }
-      foreach ($column in $cells.Keys) {
-        if ([int]$column -gt $maxColumn) {
-          $extraToken = $cells[$column].token
-          if ($extraToken -ne 'null' -and $extraToken -ne '""') { throw 'Data found outside named worksheet headers.' }
-        }
-      }
-      if (-not $hasValue) { continue }
-      $parts.Add('"__source_row_number":' + $physicalRow)
-      $positionColumn = 0; foreach ($column in $headers.Keys) { if ($headers[$column] -ceq 'Posisi') { $positionColumn = [int]$column; break } }
-      if ($positionColumn -gt 0 -and $cells[$positionColumn] -and $cells[$positionColumn].isDate) {
-        $parts.Add('"__excel_date_serial":true')
-        $parts.Add('"__excel_date_1904":' + $(if ($date1904) {'true'} else {'false'}))
-      }
-      $outputBatch.Add('{' + [string]::Join(',',$parts.ToArray()) + '}')
-      $rowCount++
-      if ($outputBatch.Count -ge 1000) { [Console]::Out.WriteLine([string]::Join([char]10,$outputBatch.ToArray())); $outputBatch.Clear() }
-      if ($limit -gt 0 -and $rowCount -ge $limit) { break }
-      $null=$reader.Read(); continue
-    }
-    if ($outputBatch.Count) { [Console]::Out.WriteLine([string]::Join([char]10,$outputBatch.ToArray())); $outputBatch.Clear() }
-  } finally { $reader.Dispose(); $stream.Dispose() }
-  if ($maxColumn -eq 0) { throw 'Worksheet header row missing.' }
-} finally { $zip.Dispose() }
-`;
-
-async function checksumFile(filePath) {
+async function checksumFile(path) {
   const hash = createHash('sha256');
-  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest('hex');
 }
 
-async function writeChunk(stream, text) {
-  if (!stream.write(text)) await once(stream, 'drain');
+async function openWorkbook(path) {
+  const zip = await new Promise((ok, fail) => yauzl.open(path, { lazyEntries: true, autoClose: false, validateEntrySizes: true },
+    (error, file) => error ? fail(error) : ok(file)));
+  const entries = new Map();
+  try {
+    await new Promise((ok, fail) => {
+      zip.on('entry', (entry) => { entries.set(entry.fileName, entry); zip.readEntry(); });
+      zip.once('end', ok);
+      zip.once('error', fail);
+      zip.readEntry();
+    });
+    return { zip, entries };
+  } catch (error) {
+    zip.close();
+    throw error;
+  }
+}
+
+async function entryStream(book, name, required = true) {
+  const entry = book.entries.get(name);
+  if (!entry) {
+    if (!required) return null;
+    throw new Error('Workbook component missing.');
+  }
+  return new Promise((ok, fail) => book.zip.openReadStream(entry, (error, stream) => error ? fail(error) : ok(stream)));
+}
+
+async function parseEntry(book, name, handlers, required = true) {
+  const stream = await entryStream(book, name, required);
+  if (!stream) return false;
+  const parser = new SaxesParser();
+  const decoder = new StringDecoder('utf8');
+  for (const [event, handler] of Object.entries(handlers)) parser.on(event, handler);
+  for await (const chunk of stream) parser.write(decoder.write(chunk));
+  parser.write(decoder.end());
+  parser.close();
+  return true;
+}
+
+function columnNumber(reference) {
+  const letters = /^([A-Z]+)/.exec(reference ?? '')?.[1];
+  if (!letters) throw new Error('Worksheet cell reference invalid.');
+  let number = 0;
+  for (const letter of letters) number = number * 26 + letter.charCodeAt(0) - 64;
+  return number;
+}
+
+async function worksheetMetadata(book) {
+  let wantedRelationship = null;
+  let date1904 = false;
+  await parseEntry(book, 'xl/workbook.xml', {
+    opentag(node) {
+      if (local(node.name) === 'workbookPr') date1904 = ['1', 'true'].includes(node.attributes.date1904);
+      if (local(node.name) === 'sheet' && node.attributes.name === 'segmen_data') {
+        wantedRelationship = node.attributes['r:id'];
+      }
+    },
+  });
+  if (!wantedRelationship) throw new Error('Worksheet segmen_data not found.');
+  let target = null;
+  await parseEntry(book, 'xl/_rels/workbook.xml.rels', {
+    opentag(node) {
+      if (local(node.name) === 'Relationship' && node.attributes.Id === wantedRelationship) target = node.attributes.Target;
+    },
+  });
+  if (!target) throw new Error('Worksheet relationship invalid.');
+  const name = target.startsWith('/') ? target.slice(1) : posix.normalize(posix.join('xl', target));
+  if (!name.startsWith('xl/') || name.includes('..')) throw new Error('Worksheet relationship invalid.');
+  return { name, date1904 };
+}
+
+async function sharedStrings(book) {
+  const strings = [];
+  let inside = false; let text = ''; let textDepth = 0;
+  await parseEntry(book, 'xl/sharedStrings.xml', {
+    opentag(node) {
+      const tag = local(node.name);
+      if (tag === 'si') { inside = true; text = ''; }
+      if (inside && tag === 't') textDepth++;
+    },
+    text(value) { if (inside && textDepth) text += value; },
+    closetag(node) {
+      const tag = local(node.name);
+      if (inside && tag === 't') textDepth--;
+      if (tag === 'si') { strings.push(text); inside = false; }
+    },
+  }, false);
+  return strings;
+}
+
+async function dateStyles(book) {
+  const formats = new Map(); const styleFormats = [];
+  let inCellXfs = false;
+  await parseEntry(book, 'xl/styles.xml', {
+    opentag(node) {
+      const tag = local(node.name);
+      if (tag === 'numFmt') formats.set(Number(node.attributes.numFmtId), node.attributes.formatCode ?? '');
+      if (tag === 'cellXfs') inCellXfs = true;
+      if (inCellXfs && tag === 'xf') styleFormats.push(Number(node.attributes.numFmtId ?? 0));
+    },
+    closetag(node) { if (local(node.name) === 'cellXfs') inCellXfs = false; },
+  }, false);
+  return new Set(styleFormats.flatMap((id, index) => (
+    (id >= 14 && id <= 22) || /(^|[^\\])[dmy]/i.test(formats.get(id) ?? '') ? [index] : []
+  )));
+}
+
+function cellToken(cell, strings) {
+  if (cell.type === 'e') throw new Error('Workbook contains a stored cell error.');
+  if (cell.formula && (cell.raw === null || !cell.raw.trim())) throw new Error('Workbook formula cache is missing.');
+  if (cell.type === 'inlineStr') return JSON.stringify(cell.inline);
+  if (cell.raw === null || cell.raw === '') return 'null';
+  if (cell.type === 's') {
+    const index = Number(cell.raw);
+    if (!Number.isSafeInteger(index) || index < 0 || index >= strings.length) throw new Error('Shared string index invalid.');
+    return JSON.stringify(strings[index]);
+  }
+  if (cell.type === 'str' || cell.type === 'd') return JSON.stringify(cell.raw);
+  if (cell.type === 'b') {
+    if (cell.raw === '1') return 'true';
+    if (cell.raw === '0') return 'false';
+    throw new Error('Boolean cell token invalid.');
+  }
+  if (!/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[Ee][+-]?\d+)?$/.test(cell.raw)) throw new Error('Numeric cell token invalid.');
+  return cell.raw;
+}
+
+async function writeChunk(stream, value) {
+  if (!stream.write(value)) await once(stream, 'drain');
+}
+
+async function materializeSheet(book, sheetName, strings, styles, date1904, output, { limit, maxRows, maxMaterializedBytes }) {
+  let rowNumber = 0; let cell = null; let capture = null; let cells = new Map();
+  let headers = new Map(); let maxColumn = 0; let positionColumn = 0;
+  let rowCount = 0; let bytes = 2; let written = 0; let batch = [];
+  const ready = [];
+  const processRow = (physicalRow, rowCells) => {
+    if (physicalRow === 1) {
+      for (const [column, value] of rowCells) {
+        const token = cellToken(value, strings);
+        if (token === 'null') continue;
+        const header = String(JSON.parse(token));
+        if (header.trim()) { headers.set(column, header); maxColumn = Math.max(maxColumn, column); }
+      }
+      const missing = REQUIRED_HEADERS.filter(header => ![...headers.values()].includes(header));
+      if (missing.length) throw new Error(`Required worksheet headers missing: ${missing.join(', ')}`);
+      for (const [column, header] of headers) if (header === 'Posisi') positionColumn = column;
+      return;
+    }
+    if (physicalRow < 2) return;
+    const parts = []; let hasValue = false;
+    for (let column = 1; column <= maxColumn; column++) {
+      const header = headers.get(column);
+      if (!header) throw new Error('Worksheet header has an unnamed interior column.');
+      const token = rowCells.has(column) ? cellToken(rowCells.get(column), strings) : 'null';
+      if (token !== 'null' && token !== '""') hasValue = true;
+      parts.push(`${JSON.stringify(header)}:${token}`);
+    }
+    for (const [column, value] of rowCells) {
+      if (column > maxColumn && !['null', '""'].includes(cellToken(value, strings))) {
+        throw new Error('Data found outside named worksheet headers.');
+      }
+    }
+    if (!hasValue) return;
+    parts.push(`"__source_row_number":${physicalRow}`);
+    const position = rowCells.get(positionColumn);
+    if (position && !['s', 'inlineStr', 'str', 'd'].includes(position.type) && styles.has(position.style)) {
+      parts.push('"__excel_date_serial":true');
+      parts.push(`"__excel_date_1904":${date1904}`);
+    }
+    ready.push(`{${parts.join(',')}}`);
+  };
+  const stream = await entryStream(book, sheetName);
+  const parser = new SaxesParser();
+  const decoder = new StringDecoder('utf8');
+  parser.on('opentag', (node) => {
+    const tag = local(node.name);
+    if (tag === 'row') { rowNumber = Number(node.attributes.r); cells = new Map(); }
+    if (tag === 'c') cell = { column: columnNumber(node.attributes.r), type: node.attributes.t ?? '', style: Number(node.attributes.s ?? 0), raw: null, inline: '', formula: false };
+    if (!cell) return;
+    if (tag === 'f') cell.formula = true;
+    if (tag === 'v' || (tag === 't' && cell.type === 'inlineStr')) capture = tag;
+  });
+  parser.on('text', value => {
+    if (!cell || !capture) return;
+    if (capture === 'v') cell.raw = (cell.raw ?? '') + value;
+    else cell.inline += value;
+  });
+  parser.on('closetag', (node) => {
+    const tag = local(node.name);
+    if (tag === capture) capture = null;
+    if (tag === 'c') { cells.set(cell.column, cell); cell = null; }
+    if (tag === 'row') processRow(rowNumber, cells);
+  });
+  for await (const chunk of stream) {
+    parser.write(decoder.write(chunk));
+    for (const row of ready.splice(0)) {
+      if (limit && rowCount >= limit) break;
+      bytes += Buffer.byteLength(row, 'utf8') + (rowCount ? 1 : 0);
+      if (rowCount >= maxRows || bytes > maxMaterializedBytes) throw new Error('Sheet segmen_data melebihi batas aman pemrosesan.');
+      batch.push(row); rowCount++;
+      if (batch.length >= 1000) {
+        await writeChunk(output, (written ? ',' : '') + batch.join(','));
+        written += batch.length; batch = [];
+      }
+    }
+    if (limit && rowCount >= limit) { stream.destroy(); break; }
+  }
+  if (!(limit && rowCount >= limit)) { parser.write(decoder.end()); parser.close(); }
+  if (batch.length) await writeChunk(output, (written ? ',' : '') + batch.join(','));
+  if (!maxColumn || !rowCount) throw new Error('Sheet segmen_data tidak menghasilkan baris.');
+  return rowCount;
 }
 
 export async function materializePositionWorkbook(filePath, {
-  limit = 0, powershell = 'powershell.exe', maxRows = 2_000_000,
-  maxMaterializedBytes = 800 * 1024 * 1024,
+  limit = 0, maxRows = 2_000_000, maxMaterializedBytes = 800 * 1024 * 1024,
 } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 0) throw new Error('Limit XLSX harus bilangan bulat nonnegatif.');
   if (!Number.isSafeInteger(maxRows) || maxRows < 1 || !Number.isSafeInteger(maxMaterializedBytes) || maxMaterializedBytes < 1) {
@@ -180,58 +245,28 @@ export async function materializePositionWorkbook(filePath, {
   const directory = await mkdtemp(join(tmpdir(), 'dashboard-position-xlsx-'));
   const tempPath = join(directory, 'position-rows.tmp');
   const output = createWriteStream(tempPath, { encoding: 'utf8' });
-  let rowCount = 0;
-  let materializedBytes = 2;
-  let writtenRows = 0;
-  const rowBatch = [];
-  let failed = false;
-  const child = spawn(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', POWERSHELL], {
-    windowsHide: true,
-    env: { ...process.env, POSITION_XLSX_PATH: sourcePath, POSITION_XLSX_LIMIT: String(limit), POSITION_XLSX_EXPECTED_HEADERS: REQUIRED_HEADERS.join('\u001f') },
-  });
-  // Attach immediately: the child may close before the stdout iterator drains,
-  // otherwise awaiting a late `close` listener can hang the dry-run forever.
-  const childClose = once(child, 'close');
-  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-  const stderr = [];
-  child.stderr.on('data', (chunk) => { if (stderr.length < 10) stderr.push(String(chunk)); });
+  let book;
   try {
+    book = await openWorkbook(sourcePath);
+    const [{ name, date1904 }, strings, styles] = await Promise.all([
+      worksheetMetadata(book), sharedStrings(book), dateStyles(book),
+    ]);
     await writeChunk(output, '[');
-    for await (const line of lines) {
-      if (!line) continue;
-      materializedBytes += Buffer.byteLength(line, 'utf8') + (rowCount ? 1 : 0);
-      if (rowCount >= maxRows || materializedBytes > maxMaterializedBytes) throw new Error('Sheet segmen_data melebihi batas aman pemrosesan.');
-      rowBatch.push(line);
-      rowCount += 1;
-      if (rowBatch.length >= 1000) {
-        if (writtenRows) await writeChunk(output, ',');
-        await writeChunk(output, rowBatch.join(','));
-        writtenRows += rowBatch.length; rowBatch.length = 0;
-      }
-    }
-    if (rowBatch.length) {
-      if (writtenRows) await writeChunk(output, ',');
-      await writeChunk(output, rowBatch.join(','));
-      writtenRows += rowBatch.length; rowBatch.length = 0;
-    }
-    const [code] = await Promise.all([childClose.then(([status]) => status), new Promise((resolvePromise, rejectPromise) => {
-      output.end(']'); output.once('finish', resolvePromise); output.once('error', rejectPromise);
-    })]);
-    if (code !== 0) throw new Error(`Pembacaan sheet segmen_data gagal${stderr.length ? `: ${stderr.join('').trim().slice(0, 300)}` : '.'}`);
+    const rowCount = await materializeSheet(book, name, strings, styles, date1904, output,
+      { limit, maxRows, maxMaterializedBytes });
+    output.end(']');
+    await once(output, 'finish');
+    return {
+      path: tempPath, rowCount, headers: [...REQUIRED_HEADERS], checksum, sourceSizeBytes: sourceInfo.size,
+      limited: limit > 0,
+      async verifyUnchanged() { return (await checksumFile(sourcePath)) === checksum; },
+      async cleanup() { await rm(directory, { recursive: true, force: true }); },
+    };
   } catch (error) {
-    failed = true;
-    child.kill(); output.destroy();
+    output.destroy();
     await rm(directory, { recursive: true, force: true });
     throw error;
+  } finally {
+    book?.zip.close();
   }
-  if (failed || rowCount === 0) {
-    await rm(directory, { recursive: true, force: true });
-    throw new Error('Sheet segmen_data tidak menghasilkan baris.');
-  }
-  return {
-    path: tempPath, rowCount, headers: [...REQUIRED_HEADERS], checksum, sourceSizeBytes: sourceInfo.size,
-    limited: limit > 0,
-    async verifyUnchanged() { return (await checksumFile(sourcePath)) === checksum; },
-    async cleanup() { await rm(directory, { recursive: true, force: true }); },
-  };
 }

@@ -5,7 +5,8 @@ import { executeOfficeImport, prepareOfficeSnapshot, UKER_PARSER_VERSION } from 
 import { assertExpectedImportTarget } from '../server/imports/mysql-uker-repository.mjs';
 import { readDashboardWorkbookSheet } from '../server/imports/dashboard-workbook-adapter.mjs';
 
-const workbook = await readDashboardWorkbookSheet(new URL('../data/import/dashboard_funding.xlsx', import.meta.url), 'uker_list', {
+const workbookPath = process.env.DASHBOARD_TEST_WORKBOOK_PATH || new URL('../data/import/dashboard_funding.xlsx', import.meta.url);
+const workbook = await readDashboardWorkbookSheet(workbookPath, 'uker_list', {
   expectedHeaders: ['BRANCH CODE', 'BRANCH', 'BRANCH TYPE', 'MAIN BRANCH CODE', 'AREA', 'MAIN BRANCH CLASS', 'Rural Urban'],
 });
 const sourceBytes = workbook.recordsJson;

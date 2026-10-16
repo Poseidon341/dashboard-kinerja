@@ -219,6 +219,12 @@ function buildRecord(headers, values, sourceRow) {
 
 async function handleRequest(request, response) {
   const requestUrl = new URL(request.url || '/', `http://${HOST}:${PORT}`);
+  if (process.env.DASHBOARD_RUNTIME_ENV === 'production'
+    && (requestUrl.pathname.startsWith('/api/funding/') || requestUrl.pathname.startsWith('/api/appraisal/')
+      || requestUrl.pathname === '/api/health/database')) {
+    sendJson(response, 403, { status: 'unavailable', error: 'legacy_data_api_disabled' });
+    return;
+  }
   if (requestUrl.pathname.startsWith('/api/funding/')) {
     const handled = await mysqlPositionHandler(request, response);
     if (handled === false) await mysqlReferenceHandler(request, response);

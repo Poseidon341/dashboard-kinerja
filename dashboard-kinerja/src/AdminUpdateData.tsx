@@ -2,12 +2,14 @@ import React, { useEffect, useState } from 'react';
 import { FileSpreadsheet, LockKeyhole, RefreshCw, UploadCloud } from 'lucide-react';
 
 type ReportType = { key: string; label: string; available: boolean; template?: string; reason?: string };
-type PreviewPeriod = { rows: number; dates: number; existing: null | { rows: number; dates: number; source: string } };
+type PreviewDate = { rows: number; validRows: number; invalidRows: number; officeLabels: number;
+  segments: number; products: number; identicalSource: boolean;
+  existing: null | { rows: number; source: string; checksum?: string; version?: number; batchId?: string } };
 type Preview = { previewId: string; filename: string; checksum: string; totalRows: number; validRows: number;
   invalidRows: number; validationErrors: Record<string, number>; headers: string[];
-  previewRows: Array<Record<string, unknown>>; periods: Record<string, PreviewPeriod> };
-type Job = { status: string; phase: string; processed: number; total: number; periods: string[];
-  error?: string | null; result?: { publishedPeriods: string[] } | null };
+  previewRows: Array<Record<string, unknown>>; dates: Record<string, PreviewDate> };
+type Job = { status: string; phase: string; processed: number; total: number; dates: string[];
+  error?: string | null; result?: { publishedDates: string[]; alreadyPublishedDates?: string[] } | null };
 
 const defaultTypes: ReportType[] = [
   { key: 'position', label: 'Posisi Dana / segmen_data', available: true },
@@ -35,6 +37,7 @@ export function AdminUpdateData({ onPublished }: { onPublished: () => void }) {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [decisions, setDecisions] = useState<Record<string, 'add' | 'replace' | 'cancel'>>({});
   const [confirmation, setConfirmation] = useState('');
+  const [snapshotComplete, setSnapshotComplete] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [jobId, setJobId] = useState('');
@@ -75,7 +78,7 @@ export function AdminUpdateData({ onPublished }: { onPublished: () => void }) {
   const selectedCount = Object.values(decisions).filter(value => value !== 'cancel').length;
   const canCommit = !!auth && !!preview && preview.invalidRows === 0
     && Object.keys(preview.validationErrors).length === 0 && selectedCount > 0
-    && (!hasReplacement || confirmation === 'GANTI DATA PERIODE') && !busy && !jobId;
+    && snapshotComplete && (!hasReplacement || confirmation === 'GANTI SNAPSHOT TANGGAL') && !busy && !jobId;
 
   async function login(event: React.FormEvent) {
     event.preventDefault(); setAuthError('');
@@ -99,9 +102,10 @@ export function AdminUpdateData({ onPublished }: { onPublished: () => void }) {
         }, body: file,
       });
       setPreview(data);
-      setDecisions(Object.fromEntries(Object.entries(data.periods).map(([period, item]) =>
-        [period, item.existing ? 'cancel' : 'add'])));
+      setDecisions(Object.fromEntries(Object.entries(data.dates).map(([date, item]) =>
+        [date, item.existing ? 'cancel' : 'add'])));
       setConfirmation('');
+      setSnapshotComplete(false);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Validasi upload gagal.'); }
     finally { setBusy(false); }
   }
@@ -112,10 +116,10 @@ export function AdminUpdateData({ onPublished }: { onPublished: () => void }) {
     try {
       const data = await api<{ jobId: string }>('/api/admin/commit', {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-CSRF': auth.csrf },
-        body: JSON.stringify({ previewId: preview.previewId, decisions, confirmation }),
+        body: JSON.stringify({ previewId: preview.previewId, decisions, confirmation, snapshotComplete }),
       });
       setJobId(data.jobId); setJob({ status: 'processing', phase: 'queued', processed: 0,
-        total: preview.totalRows, periods: Object.keys(decisions).filter(period => decisions[period] !== 'cancel') });
+        total: preview.totalRows, dates: Object.keys(decisions).filter(date => decisions[date] !== 'cancel') });
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Penyimpanan gagal.'); }
     finally { setBusy(false); }
   }
@@ -138,7 +142,7 @@ export function AdminUpdateData({ onPublished }: { onPublished: () => void }) {
     <div className="rounded-2xl bg-[#0b2347] p-5 text-white shadow-sm">
       <p className="text-[10px] font-bold uppercase tracking-widest text-sky-200">Admin · Update Data</p>
       <h2 className="mt-1 text-xl font-extrabold">Upload laporan Excel</h2>
-      <p className="mt-2 text-xs text-blue-100/80">Validasi dan periksa periode sebelum menyimpan. Setiap periode lama tetap tersimpan sebagai versi sebelumnya.</p>
+      <p className="mt-2 text-xs text-blue-100/80">Validasi setiap tanggal posisi sebelum menyimpan. Snapshot lama tetap tersedia sebagai versi sebelumnya.</p>
       <p className="mt-2 text-[11px] text-blue-100/70">Masuk sebagai {auth.user}</p>
       <button type="button" onClick={async () => {
         try { await api('/api/admin/logout', { method: 'POST' }); } catch { /* Logout lokal tetap dijalankan. */ } finally {
@@ -170,7 +174,8 @@ export function AdminUpdateData({ onPublished }: { onPublished: () => void }) {
           {Object.keys(preview.validationErrors).length > 0 && <p role="alert" className="text-rose-700">Kesalahan: {Object.entries(preview.validationErrors).map(([key, value]) => `${key} (${value})`).join(', ')}</p>}
         </div> : <p className="mt-4 text-xs text-slate-500">Belum ada file yang divalidasi.</p>}
         {job && <div className="mt-4 rounded-xl bg-blue-50 p-3 text-xs text-blue-900">
-          <p className="font-bold">{job.status === 'completed' ? 'Data selesai dipublikasikan' : job.status === 'failed' ? 'Penyimpanan gagal' : 'Sedang diproses'}</p>
+          <p className="font-bold">{job.status === 'completed' ? (job.result?.publishedDates.length ? 'Data selesai dipublikasikan' : 'Snapshot identik sudah tersedia') : job.status === 'failed' ? 'Penyimpanan gagal' : 'Sedang diproses'}</p>
+          {job.result?.publishedDates.length ? <p>Tanggal terbit: {job.result.publishedDates.join(', ')}</p> : null}
           <p>{job.phase} · {job.processed.toLocaleString('id-ID')} / {job.total.toLocaleString('id-ID')} baris</p>
           {job.error && <p className="mt-1 text-rose-700">{job.error}</p>}
         </div>}
@@ -178,16 +183,18 @@ export function AdminUpdateData({ onPublished }: { onPublished: () => void }) {
     </div>
     {error && <p role="alert" className="rounded-xl bg-rose-50 p-3 text-xs text-rose-700">{error}</p>}
     {preview && <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-      <h3 className="text-sm font-bold text-slate-800">Periode dari kolom Posisi</h3>
-      <p className="mt-1 text-xs text-slate-500">Periode lama dibatalkan secara default. Mengganti periode berarti seluruh data aktif bulan itu berpindah ke snapshot file ini; data lama tetap ada untuk pemulihan.</p>
-      <div className="mt-4 space-y-2">{Object.entries(preview.periods).map(([period, item]) => <div key={period} className="grid gap-2 rounded-xl border border-slate-200 p-3 text-xs sm:grid-cols-[1fr_auto] sm:items-center">
-        <div><span className="font-bold text-slate-800">{period}</span> · {item.rows.toLocaleString('id-ID')} baris / {item.dates} tanggal
-          <p className="mt-1 text-slate-500">{item.existing ? `Sudah ada: ${item.existing.rows.toLocaleString('id-ID')} baris / ${item.existing.dates} tanggal` : 'Periode baru'}</p></div>
-        <select aria-label={`Tindakan periode ${period}`} value={decisions[period] ?? 'cancel'} onChange={event => setDecisions(current => ({ ...current, [period]: event.target.value as 'add' | 'replace' | 'cancel' }))} className="rounded-lg border border-slate-300 bg-white p-2">
-          <option value="cancel">Batalkan periode ini</option><option value={item.existing ? 'replace' : 'add'}>{item.existing ? 'Ganti Data Periode' : 'Tambahkan periode'}</option>
+      <h3 className="text-sm font-bold text-slate-800">Tanggal posisi dari kolom Posisi</h3>
+      <p className="mt-1 text-xs text-slate-500">Tanggal yang sudah ada dilewati secara default. Penggantian hanya berlaku untuk tanggal terpilih; tanggal lain tetap aktif. Periksa kelengkapan cakupan sumber sebelum menyimpan.</p>
+      <div className="mt-4 space-y-2">{Object.entries(preview.dates).map(([date, item]) => <div key={date} className="grid gap-2 rounded-xl border border-slate-200 p-3 text-xs sm:grid-cols-[1fr_auto] sm:items-center">
+        <div><span className="font-bold text-slate-800">{date}</span> · bulan {date.slice(0, 7)} · {item.rows.toLocaleString('id-ID')} baris
+          <p className="mt-1 text-slate-500">Valid {item.validRows.toLocaleString('id-ID')} / tidak valid {item.invalidRows.toLocaleString('id-ID')} · {item.officeLabels} label kantor · {item.segments} segmen · {item.products} produk</p>
+          <p className="mt-1 text-slate-500">{item.identicalSource ? 'Snapshot dari file identik sudah aktif' : item.existing ? `Sudah ada: ${item.existing.rows.toLocaleString('id-ID')} baris` : 'Tanggal baru'}</p></div>
+        <select aria-label={`Tindakan tanggal ${date}`} value={decisions[date] ?? 'cancel'} onChange={event => setDecisions(current => ({ ...current, [date]: event.target.value as 'add' | 'replace' | 'cancel' }))} className="rounded-lg border border-slate-300 bg-white p-2">
+          <option value="cancel">Lewati tanggal ini</option><option value={item.existing ? 'replace' : 'add'}>{item.existing ? 'Ganti Snapshot Tanggal' : 'Tambah snapshot tanggal'}</option>
         </select>
       </div>)}</div>
-      {hasReplacement && <label className="mt-4 block text-xs font-semibold text-amber-800">Ketik GANTI DATA PERIODE untuk mengonfirmasi penggantian
+      <label className="mt-4 flex items-start gap-2 text-xs font-semibold text-slate-700"><input type="checkbox" checked={snapshotComplete} onChange={event => setSnapshotComplete(event.target.checked)} className="mt-0.5" />Saya telah memastikan setiap tanggal terpilih memuat snapshot lengkap untuk cakupan sumbernya. File parsial tidak boleh dipublikasikan sebagai pengganti snapshot tanggal.</label>
+      {hasReplacement && <label className="mt-4 block text-xs font-semibold text-amber-800">Ketik GANTI SNAPSHOT TANGGAL untuk mengonfirmasi penggantian
         <input value={confirmation} onChange={event => setConfirmation(event.target.value)} className="mt-1 w-full rounded-xl border border-amber-300 p-3 text-sm" />
       </label>}
       <button type="button" disabled={!canCommit} onClick={commit} className="mt-4 rounded-xl bg-emerald-700 px-5 py-3 text-xs font-bold text-white disabled:opacity-50">Konfirmasi & simpan ke MySQL</button>
@@ -198,7 +205,7 @@ export function AdminUpdateData({ onPublished }: { onPublished: () => void }) {
     </div>}
     <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
       <h3 className="flex items-center gap-2 text-sm font-bold text-slate-800"><RefreshCw size={16} /> Riwayat upload</h3>
-      {history.length ? <div className="mt-3 overflow-x-auto"><table className="min-w-[600px] w-full text-left text-xs"><thead><tr className="border-b border-slate-200 text-slate-500"><th className="p-2">Waktu</th><th className="p-2">Pengguna</th><th className="p-2">Laporan</th><th className="p-2">Periode</th><th className="p-2">Status</th></tr></thead><tbody>{history.map((item, index) => <tr key={index} className="border-b border-slate-100"><td className="p-2">{String(item.at ?? '')}</td><td className="p-2">{String(item.user ?? '—')}</td><td className="p-2">Posisi Dana</td><td className="p-2">{String(item.period ?? '')}</td><td className="p-2">{String(item.status ?? '')}</td></tr>)}</tbody></table></div>
+      {history.length ? <div className="mt-3 overflow-x-auto"><table className="min-w-[600px] w-full text-left text-xs"><thead><tr className="border-b border-slate-200 text-slate-500"><th className="p-2">Waktu</th><th className="p-2">Pengguna</th><th className="p-2">Laporan</th><th className="p-2">Tanggal / periode lama</th><th className="p-2">Status</th></tr></thead><tbody>{history.map((item, index) => <tr key={index} className="border-b border-slate-100"><td className="p-2">{String(item.at ?? '')}</td><td className="p-2">{String(item.user ?? '—')}</td><td className="p-2">Posisi Dana</td><td className="p-2">{String(item.period ?? '')}</td><td className="p-2">{String(item.status ?? '')}</td></tr>)}</tbody></table></div>
         : <p className="mt-3 text-xs text-slate-500">Belum ada publikasi melalui menu Admin.</p>}
     </div>
   </section>;

@@ -205,6 +205,14 @@ export function createShadowRequestHandler(dependencies = {}) {
   return async function handleShadowRequest(request, response) {
     const adminHandled = await adminHandler(request, response);
     if (adminHandled !== false) return;
+    const path = new URL(request.url || '/', 'http://127.0.0.1').pathname;
+    const dataPath = path.startsWith('/api/funding/') || path.startsWith('/api/appraisal/')
+      || path.startsWith('/api/shadow/');
+    if (deps.env.DASHBOARD_RUNTIME_ENV === 'production' && dataPath
+      && !adminHandler.authorizeDataRequest(request)) {
+      sendJson(response, 401, { status: 'error', error: 'data_auth_required' });
+      return;
+    }
     const fundingHandled = await fundingHandler(request, response);
     if (fundingHandled !== false) return;
     const referenceHandled = await referenceHandler(request, response);

@@ -34,6 +34,8 @@ npm ci
 npm run build
 ```
 
+Tes snapshot Uker, RMFT, dan RKA membutuhkan workbook privat yang tidak masuk Git. Pada mesin pengujian, set `DASHBOARD_TEST_WORKBOOK_PATH` ke path absolut `dashboard_funding.xlsx` di luar checkout, lalu jalankan `node --test scripts/*.test.mjs`. Jangan menyalin workbook ke rilis atau repository. Tes upload yang lain memakai data sintetis.
+
 Salin [.env.production.example](../.env.production.example) ke `/etc/dashboard-funding/backend.env`, set izin root-only, lalu isi dengan editor interaktif. Jangan menaruh password atau hash asli di perintah shell, repo, unit systemd, atau tiket. Jangan menyalin `.env` Windows.
 
 ```bash
@@ -65,7 +67,7 @@ curl --silent --output /dev/null --write-out 'Posisi API HTTP %{http_code}\n' ht
 curl --silent --output /dev/null --write-out 'Admin tanpa login HTTP %{http_code}\n' http://127.0.0.1:8788/api/admin/session
 ```
 
-Harapkan `200` untuk Funding bila skema, publikasi, dan data tersedia; `401` untuk Admin tanpa sesi. `403 funding_target_not_allowed` berarti konfigurasi atau identitas database aktual tidak cocok dengan allowlist. `503` berarti periksa koneksi, skema, atau kesiapan data melalui log yang aman; jangan mencetak kredensial.
+Harapkan `401 data_auth_required` untuk Funding tanpa sesi Admin dan `401` untuk Admin tanpa sesi. Setelah sesi Admin valid, Funding dapat mengembalikan `200` bila data tersedia. `403 funding_target_not_allowed` berarti target database tidak cocok. `503` berarti koneksi, skema, atau data belum siap.
 
 ## 4. Sajikan frontend melalui Nginx dan Cloudflare Tunnel
 
@@ -79,7 +81,7 @@ sudo systemctl reload nginx
 curl --silent --output /dev/null --write-out 'Frontend HTTP %{http_code}\n' http://127.0.0.1:8080/
 ```
 
-Konfigurasikan satu public hostname Cloudflare Tunnel yang diarahkan ke `http://127.0.0.1:8080`, bukan ke Vite port 5173 atau backend 8788. Lindungi aplikasi publik dengan kebijakan Cloudflare Access; beri hak Admin hanya pada identitas yang disetujui. Backend tetap meminta login Admin terpisah, token CSRF, Origin HTTPS yang sama dengan `DASHBOARD_PUBLIC_ORIGIN`, dan mengirim cookie `HttpOnly; SameSite=Strict; Secure` pada production. Cloudflare Access dan autentikasi Admin saling melengkapi. Pastikan koneksi HTTPS publik sebelum menguji Admin.
+Konfigurasikan satu public hostname Cloudflare Tunnel yang diarahkan ke `http://127.0.0.1:8080`, bukan ke Vite port 5173 atau backend 8788. Pada production, endpoint data Funding, Appraisal, dan Shadow memerlukan sesi Admin yang diverifikasi backend. Login PN lama belum memiliki bukti identitas tambahan; dashboard PN production tetap tertutup sampai metode otorisasi PN disetujui dan diimplementasikan. Jangan membuka akses umum sebelum itu. Backend Admin tetap meminta login terpisah, token CSRF, Origin HTTPS yang sama dengan `DASHBOARD_PUBLIC_ORIGIN`, dan mengirim cookie `HttpOnly; SameSite=Strict; Secure`.
 
 Nginx mengirim seluruh `/api/` ke backend yang sama sehingga frontend memakai URL relatif dan tidak membutuhkan proxy Vite. Jangan mengarahkan `/api/appraisal/*` ke server Google Sheets legacy. Untuk upload besar, periksa batas body Cloudflare, kapasitas disk sementara, dan waktu proses. Upload yang lebih besar dari batas Cloudflare harus memakai jalur privat yang disetujui, bukan membuka database atau backend ke internet.
 

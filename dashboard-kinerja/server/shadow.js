@@ -1,5 +1,5 @@
 import { pathToFileURL } from 'node:url';
-import { closeDatabasePool } from './db.js';
+import { closeDatabasePool, getDatabaseConfig } from './db.js';
 import { createShadowServer } from './shadow-master-api.mjs';
 
 export const SHADOW_HOST = '127.0.0.1';
@@ -16,10 +16,14 @@ export function getShadowPort(env = process.env) {
   return port;
 }
 
-export function startShadowServer({ port = getShadowPort() } = {}) {
+export function startShadowServer({ port } = {}) {
+  // Load the local .env before reading SHADOW_API_PORT or creating request handlers.
+  // Production keeps using the process environment supplied by systemd.
+  getDatabaseConfig();
+  const listenPort = port ?? getShadowPort();
   const server = createShadowServer();
-  server.listen(port, SHADOW_HOST, () => {
-    console.log(`[shadow-api] Listening on http://${SHADOW_HOST}:${port}`);
+  server.listen(listenPort, SHADOW_HOST, () => {
+    console.log(`[shadow-api] Listening on http://${SHADOW_HOST}:${listenPort}`);
   });
   const shutdown = () => server.close(async () => { await closeDatabasePool(); });
   process.once('SIGINT', shutdown);

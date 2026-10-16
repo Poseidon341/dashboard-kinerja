@@ -18,7 +18,8 @@ export class DatabaseConfigurationError extends Error {
 }
 
 export function getDatabaseConfig(env = process.env) {
-  if (env === process.env && !localEnvironmentLoaded && existsSync(envFile)) {
+  if (env === process.env && !localEnvironmentLoaded
+    && env.DASHBOARD_RUNTIME_ENV !== 'production' && existsSync(envFile)) {
     if (typeof process.loadEnvFile !== 'function') {
       const error = new DatabaseConfigurationError([]);
       error.code = 'ENV_FILE_UNSUPPORTED';

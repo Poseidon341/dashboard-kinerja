@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import yazl from 'yazl';
 import { importPositionFile, scanPositionFile } from '../server/imports/position-importer.mjs';
 import { assertPositionTestTarget } from '../server/imports/mysql-position-repository.mjs';
 import { materializePositionWorkbook } from '../server/imports/position-xlsx-adapter.mjs';
@@ -23,22 +25,15 @@ async function tempSource(t, text) {
 async function tempPositionWorkbook(t) {
   const directory = await mkdtemp(join(tmpdir(), 'position-xlsx-fixture-'));
   const workbookPath = join(directory, 'fixture.xlsx');
-  const script = String.raw`
-$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression; Add-Type -AssemblyName System.IO.Compression.FileSystem
-$zip=[IO.Compression.ZipFile]::Open($env:FIXTURE_XLSX_PATH,[IO.Compression.ZipArchiveMode]::Create)
-function Add-Text([string]$name,[string]$text) { $entry=$zip.CreateEntry($name); $writer=[IO.StreamWriter]::new($entry.Open(),[Text.UTF8Encoding]::new($false)); try {$writer.Write($text)} finally {$writer.Dispose()} }
-try {
-Add-Text 'xl/workbook.xml' '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><workbookPr date1904="0"/><sheets><sheet name="segmen_data" sheetId="1" r:id="rId1"/></sheets></workbook>'
-Add-Text 'xl/_rels/workbook.xml.rels' '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'
-Add-Text 'xl/sharedStrings.xml' '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="17" uniqueCount="17"><si><t>Posisi</t></si><si><t>Segmentasi BPR</t></si><si><t>Produk</t></si><si><t>Nama Cabang</t></si><si><t>Nama Uker</t></si><si><t>Jumlah Rekening</t></si><si><t>Saldo</t></si><si><t>MIKRO</t></si><si><t>TABUNGAN</t></si><si><t>KC Contoh</t></si><si><t>UNIT Contoh</t></si><si><t>31/12/2025</t></si><si><t>RITEL</t></si><si><t>GIRO</t></si><si><t>1,234</t></si><si><t></t></si><si><t>02/01/2026</t></si></sst>'
-Add-Text 'xl/styles.xml' '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>'
-Add-Text 'xl/worksheets/sheet1.xml' '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c><c r="D1" t="s"><v>3</v></c><c r="E1" t="s"><v>4</v></c><c r="F1" t="s"><v>5</v></c><c r="G1" t="s"><v>6</v></c></row><row r="2"><c r="A2" s="1"><v>46022</v></c><c r="B2" t="s"><v>7</v></c><c r="C2" t="s"><v>8</v></c><c r="D2" t="s"><v>9</v></c><c r="E2" t="s"><v>10</v></c><c r="F2"><v>3</v></c><c r="G2"><v>1234567890123.123456789012345</v></c></row><row r="3"><c r="A3" t="s"><v>11</v></c><c r="B3" t="s"><v>12</v></c><c r="C3" t="s"><v>13</v></c><c r="D3" t="s"><v>9</v></c><c r="E3" t="s"><v>10</v></c><c r="F3"><v>0</v></c><c r="G3" t="s"><v>14</v></c></row><row r="4"><c r="A4" s="1"><v>46024</v></c><c r="B4" t="s"><v>7</v></c><c r="C4" t="s"><v>8</v></c><c r="D4" t="s"><v>9</v></c><c r="E4" t="s"><v>10</v></c><c r="F4"/><c r="G4"/></row></sheetData></worksheet>'
-} finally {$zip.Dispose()}
-`;
-  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], {
-    encoding: 'utf8', windowsHide: true, env: { ...process.env, FIXTURE_XLSX_PATH: workbookPath },
-  });
-  assert.equal(result.status, 0, `PowerShell fixture workbook generation must succeed: ${result.stderr}`);
+  const zip = new yazl.ZipFile();
+  const add = (name, value) => zip.addBuffer(Buffer.from(value, 'utf8'), name);
+  add('xl/workbook.xml', '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><workbookPr date1904="0"/><sheets><sheet name="segmen_data" sheetId="1" r:id="rId1"/></sheets></workbook>');
+  add('xl/_rels/workbook.xml.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>');
+  add('xl/sharedStrings.xml', '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="17" uniqueCount="17"><si><t>Posisi</t></si><si><t>Segmentasi BPR</t></si><si><t>Produk</t></si><si><t>Nama Cabang</t></si><si><t>Nama Uker</t></si><si><t>Jumlah Rekening</t></si><si><t>Saldo</t></si><si><t>MIKRO</t></si><si><t>TABUNGAN</t></si><si><t>KC Contoh</t></si><si><t>UNIT Contoh</t></si><si><t>31/12/2025</t></si><si><t>RITEL</t></si><si><t>GIRO</t></si><si><t>1,234</t></si><si><t></t></si><si><t>02/01/2026</t></si></sst>');
+  add('xl/styles.xml', '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>');
+  add('xl/worksheets/sheet1.xml', '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c><c r="D1" t="s"><v>3</v></c><c r="E1" t="s"><v>4</v></c><c r="F1" t="s"><v>5</v></c><c r="G1" t="s"><v>6</v></c></row><row r="2"><c r="A2" s="1"><v>46022</v></c><c r="B2" t="s"><v>7</v></c><c r="C2" t="s"><v>8</v></c><c r="D2" t="s"><v>9</v></c><c r="E2" t="s"><v>10</v></c><c r="F2"><v>3</v></c><c r="G2"><v>1234567890123.123456789012345</v></c></row><row r="3"><c r="A3" t="s"><v>11</v></c><c r="B3" t="s"><v>12</v></c><c r="C3" t="s"><v>13</v></c><c r="D3" t="s"><v>9</v></c><c r="E3" t="s"><v>10</v></c><c r="F3"><v>0</v></c><c r="G3" t="s"><v>14</v></c></row><row r="4"><c r="A4" s="1"><v>46024</v></c><c r="B4" t="s"><v>7</v></c><c r="C4" t="s"><v>8</v></c><c r="D4" t="s"><v>9</v></c><c r="E4" t="s"><v>10</v></c><c r="F4"/><c r="G4"/></row></sheetData></worksheet>');
+  zip.end();
+  await pipeline(zip.outputStream, createWriteStream(workbookPath));
   t.after(() => rm(directory, { recursive: true, force: true }));
   return workbookPath;
 }
@@ -81,7 +76,7 @@ test('XLSX adapter limit membatasi record tanpa mengubah sumber workbook', async
 });
 
 test('stream JSON menjaga raw record, urutan sumber, dan nilai numerik asli lintas batas chunk UTF-8', async (t) => {
-  const raw1 = '{"Posisi":"31/12/2025","Segmentasi BPR":"MIKRO","Produk":"TABUNGAN","Nama Cabang":"KC Contoh","Nama Uker":"UNIT Cianjur 🌾","Jumlah Rekening":0,"Saldo":1234567890123.123456789012345}';
+  const raw1 = '{"Posisi":"31/12/2025","Segmentasi BPR":"MIKRO","Produk":"TABUNGAN","Nama Cabang":"KC Contoh","Nama Uker":"UNIT Cianjur ðŸŒ¾","Jumlah Rekening":0,"Saldo":1234567890123.123456789012345}';
   const raw2 = JSON.stringify(fixtureRecord({ 'Jumlah Rekening': '', Saldo: null }));
   const raw3 = JSON.stringify(fixtureRecord({ 'Jumlah Rekening': null, Saldo: '0' }));
   const source = `[${raw1},\n${raw2},${raw3}]`;

@@ -38,31 +38,45 @@ export async function sha256File(path) {
   return hash.digest('hex');
 }
 
-export function validatePeriodDecisions(sourcePeriods, existingPeriods, decisions, confirmation) {
-  const source = Object.keys(sourcePeriods).sort();
-  if (!source.length || source.some(period => !/^\d{4}-(0[1-9]|1[0-2])$/.test(period))) {
-    throw new Error('Periode sumber tidak dapat ditentukan secara andal.');
+function validDate(date) {
+  if (!/^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(date)) return false;
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === date;
+}
+
+function nextDate(date) {
+  if (!validDate(date)) throw new Error('Tanggal posisi sumber tidak valid.');
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  parsed.setUTCDate(parsed.getUTCDate() + 1);
+  return parsed.toISOString().slice(0, 10);
+}
+
+export function validateDateDecisions(sourceDates, existingDates, decisions, confirmation, snapshotComplete) {
+  const source = Object.keys(sourceDates).sort();
+  if (!source.length || source.some(date => !validDate(date) || !Number.isSafeInteger(sourceDates[date]) || sourceDates[date] < 1)) {
+    throw new Error('Tanggal atau jumlah baris sumber tidak valid.');
   }
-  if (Object.keys(decisions ?? {}).some(period => !source.includes(period))) throw new Error('Pilihan periode di luar preview ditolak.');
+  if (Object.keys(decisions ?? {}).some(date => !source.includes(date))) throw new Error('Pilihan tanggal di luar preview ditolak.');
   const selected = [];
-  for (const period of source) {
-    const action = decisions?.[period];
-    const exists = Number(existingPeriods?.[period]?.rows ?? 0) > 0;
+  for (const date of source) {
+    const action = decisions?.[date];
+    const exists = Number(existingDates?.[date]?.rows ?? 0) > 0;
     if (action === 'cancel') continue;
-    if (exists && action !== 'replace') throw new Error(`Periode ${period} sudah tersedia; pilih Batalkan atau Ganti Data Periode.`);
-    if (!exists && action !== 'add') throw new Error(`Periode ${period} belum tersedia; pilih Tambahkan atau Batalkan.`);
-    selected.push({ period, action, sourceRows: sourcePeriods[period], previousRows: existingPeriods?.[period]?.rows ?? 0 });
+    if (exists && action !== 'replace') throw new Error(`Snapshot ${date} sudah tersedia; pilih Lewati atau Ganti Snapshot Tanggal.`);
+    if (!exists && action !== 'add') throw new Error(`Snapshot ${date} belum tersedia; pilih Tambah atau Lewati.`);
+    selected.push({ date, action, sourceRows: sourceDates[date], previousRows: existingDates?.[date]?.rows ?? 0 });
   }
-  if (!selected.length) throw new Error('Tidak ada periode yang dipilih untuk disimpan.');
-  if (selected.some(item => item.action === 'replace') && confirmation !== 'GANTI DATA PERIODE') {
-    throw new Error('Ketik GANTI DATA PERIODE untuk mengonfirmasi penggantian periode lama.');
+  if (!selected.length) throw new Error('Tidak ada tanggal yang dipilih untuk disimpan.');
+  if (snapshotComplete !== true) throw new Error('Konfirmasi kelengkapan snapshot tiap tanggal sebelum menyimpan.');
+  if (selected.some(item => item.action === 'replace') && confirmation !== 'GANTI SNAPSHOT TANGGAL') {
+    throw new Error('Ketik GANTI SNAPSHOT TANGGAL untuk mengonfirmasi penggantian tanggal lama.');
   }
   return selected;
 }
 
-export async function currentPositionPeriods(connection) {
+export async function currentPositionDates(connection) {
   const [baseObjects] = await connection.execute(
-    `SELECT o.object_id,b.batch_id FROM dashboard_source_registry s
+    `SELECT o.object_id,o.source_checksum,b.batch_id FROM dashboard_source_registry s
      JOIN dashboard_import_batch b ON b.source_id=s.source_id AND b.status='completed'
      JOIN dashboard_import_object_identity i ON i.batch_id=b.batch_id AND i.object_key=?
      JOIN dashboard_import_object o ON o.object_id=i.object_id
@@ -71,32 +85,40 @@ export async function currentPositionPeriods(connection) {
   );
   if (baseObjects.length !== 1) throw new Error('Snapshot dasar Posisi Dana yang tervalidasi tidak tersedia.');
   const baseObjectId = String(baseObjects[0].object_id);
-  const [baseMonths] = await connection.execute(
-    `SELECT DATE_FORMAT(position_date,'%Y-%m') AS period,COUNT(*) AS row_count,COUNT(DISTINCT position_date) AS date_count
-     FROM dashboard_fact_position_daily WHERE object_id=? GROUP BY DATE_FORMAT(position_date,'%Y-%m')`, [baseObjectId],
+  const [baseDates] = await connection.execute(
+    `SELECT DATE_FORMAT(position_date,'%Y-%m-%d') AS date_value,COUNT(*) AS row_count
+     FROM dashboard_fact_position_daily WHERE object_id=? GROUP BY position_date`, [baseObjectId],
   );
-  const periods = Object.fromEntries(baseMonths.map(row => [row.period, { rows: Number(row.row_count), dates: Number(row.date_count), source: 'base' }]));
+  const dates = Object.fromEntries(baseDates.map(row => [row.date_value, { rows: Number(row.row_count), source: 'base',
+    batchId: baseObjects[0].batch_id, checksum: baseObjects[0].source_checksum }]));
   const [published] = await connection.execute(
-    `SELECT p.scope_key AS period,p.batch_id,p.publication_version,o.object_id
+    `SELECT p.scope_key,p.batch_id,p.publication_version,o.object_id,o.source_checksum
      FROM dashboard_domain_publication p
      JOIN dashboard_import_batch b ON b.batch_id=p.batch_id AND b.status='completed'
      JOIN dashboard_import_object_identity i ON i.batch_id=b.batch_id AND i.object_key=?
      JOIN dashboard_import_object o ON o.object_id=i.object_id
      WHERE p.domain_key=? AND p.batch_id IS NOT NULL`, [POSITION_OBJECT_KEY, ADMIN_POSITION_DOMAIN],
   );
-  for (const row of published) {
-    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(row.period)) throw new Error('Publikasi Posisi Dana memiliki scope periode tidak valid.');
+  for (const row of published.sort((a, b) => a.scope_key.length - b.scope_key.length || a.scope_key.localeCompare(b.scope_key))) {
+    const scope = String(row.scope_key);
+    if (scope.length !== 7 && !validDate(scope)) throw new Error('Scope publikasi Posisi Dana tidak valid.');
+    if (scope.length === 7 && !/^\d{4}-(0[1-9]|1[0-2])$/.test(scope)) throw new Error('Scope bulan publikasi tidak valid.');
+    const start = scope.length === 7 ? `${scope}-01` : scope;
+    const end = scope.length === 7 ? nextMonth(scope) : nextDate(scope);
     const [counts] = await connection.execute(
-      `SELECT COUNT(*) AS row_count,COUNT(DISTINCT position_date) AS date_count FROM dashboard_fact_position_daily
-       WHERE object_id=? AND position_date>=? AND position_date<?`,
-      [row.object_id, `${row.period}-01`, nextMonth(row.period)],
+      `SELECT DATE_FORMAT(position_date,'%Y-%m-%d') AS date_value,COUNT(*) AS row_count
+       FROM dashboard_fact_position_daily WHERE object_id=? AND position_date>=? AND position_date<? GROUP BY position_date`,
+      [row.object_id, start, end],
     );
-    const count = Number(counts[0]?.row_count ?? 0);
-    if (!count) throw new Error(`Publikasi periode ${row.period} tidak memiliki fakta.`);
-    periods[row.period] = { rows: count, dates: Number(counts[0].date_count), source: 'published',
-      version: Number(row.publication_version), batchId: row.batch_id };
+    if (!counts.length || counts.some(item => !validDate(String(item.date_value)) || Number(item.row_count) < 1)) {
+      throw new Error(`Publikasi ${scope} tidak memiliki fakta tanggal yang valid.`);
+    }
+    if (scope.length === 7) for (const date of Object.keys(dates)) if (date.startsWith(scope)) delete dates[date];
+    for (const item of counts) dates[item.date_value] = { rows: Number(item.row_count),
+      source: scope.length === 7 ? 'published-month' : 'published-day',
+      version: Number(row.publication_version), batchId: row.batch_id, checksum: row.source_checksum };
   }
-  return { baseObjectId, baseBatchId: baseObjects[0].batch_id, periods };
+  return { baseObjectId, baseBatchId: baseObjects[0].batch_id, dates };
 }
 
 function nextMonth(period) {
@@ -109,15 +131,23 @@ export async function previewPositionWorkbook(filePath, connection, { maxPreview
   const workbook = await materializePositionWorkbook(filePath);
   try {
     const previewRows = [];
-    const datesByPeriod = new Map();
+    const dateSummary = new Map();
     const summary = await scanPositionFile(workbook.path, {
       strictSnapshot: false, expectedRows: workbook.rowCount,
       sourceChecksum: workbook.checksum, sourceSizeBytes: workbook.sourceSizeBytes,
       onRecord: async row => {
         if (row.parsedPositionDate) {
-          const period = row.parsedPositionDate.slice(0, 7);
-          if (!datesByPeriod.has(period)) datesByPeriod.set(period, new Set());
-          datesByPeriod.get(period).add(row.parsedPositionDate);
+          const date = row.parsedPositionDate;
+          if (!dateSummary.has(date)) dateSummary.set(date, {
+            rows: 0, validRows: 0, invalidRows: 0, offices: new Set(), segments: new Set(), products: new Set(),
+          });
+          const item = dateSummary.get(date);
+          item.rows += 1;
+          if (row.parseStatus === 'valid') item.validRows += 1;
+          else item.invalidRows += 1;
+          if (row.sourceOfficeLabel) item.offices.add(row.sourceOfficeLabel);
+          if (row.sourceSegment) item.segments.add(row.sourceSegment);
+          if (row.sourceProduct) item.products.add(row.sourceProduct);
         }
         if (previewRows.length < maxPreviewRows) previewRows.push({
           sourceRowNumber: row.rowNumber, positionDate: row.parsedPositionDate,
@@ -128,15 +158,18 @@ export async function previewPositionWorkbook(filePath, connection, { maxPreview
         });
       },
     });
-    const current = await currentPositionPeriods(connection);
+    const current = await currentPositionDates(connection);
     return {
       sheet: 'segmen_data', headers: workbook.headers, checksum: workbook.checksum,
       sourceSizeBytes: workbook.sourceSizeBytes, totalRows: summary.total,
       validRows: summary.validRows, invalidRows: summary.invalidRows,
       validationErrors: summary.validationErrors, previewRows,
-      periods: Object.fromEntries(Object.entries(summary.periods).sort(([a], [b]) => a.localeCompare(b)).map(([period, rows]) => [period, {
-        rows, dates: datesByPeriod.get(period)?.size ?? 0,
-        existing: current.periods[period] ?? null,
+      dates: Object.fromEntries([...dateSummary.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, item]) => [date, {
+        rows: item.rows, validRows: item.validRows, invalidRows: item.invalidRows,
+        officeLabels: item.offices.size, segments: item.segments.size, products: item.products.size,
+        existing: current.dates[date] ?? null,
+        identicalSource: current.dates[date]?.checksum === workbook.checksum
+          && current.dates[date]?.rows === item.rows,
       }])),
     };
   } finally { await workbook.cleanup(); }
@@ -168,13 +201,13 @@ async function activeOfficeLookup(connection) {
 
 function placeholders(rows, width) { return rows.map(() => `(${Array(width).fill('?').join(',')})`).join(','); }
 
-async function ensureDates(connection, objectId, selectedPeriods, config, env) {
+async function ensureDates(connection, objectId, selectedDates, config, env) {
   const [dates] = await connection.execute(
     `SELECT DISTINCT DATE_FORMAT(parsed_position_date,'%Y-%m-%d') AS date_value
      FROM dashboard_stg_position_row WHERE object_id=? ORDER BY date_value`, [objectId],
   );
   for (const { date_value: date } of dates) {
-    if (!selectedPeriods.has(date.slice(0, 7))) continue;
+    if (!selectedDates.has(date)) continue;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Tanggal staging tidak valid.');
     const [year, month, day] = date.split('-').map(Number);
     const monthStart = `${date.slice(0, 7)}-01`;
@@ -200,13 +233,13 @@ async function ensureDates(connection, objectId, selectedPeriods, config, env) {
   }
 }
 
-async function buildCandidateFacts(connection, objectId, selectedPeriods, progress, config, env) {
+async function buildCandidateFacts(connection, objectId, selectedDates, progress, config, env) {
   const master = await activeOfficeLookup(connection);
   const [segments] = await connection.execute('SELECT segment_id,source_label FROM dashboard_dim_segment');
   const [products] = await connection.execute('SELECT product_id,source_label FROM dashboard_dim_product');
   const segmentIds = new Map(segments.map(row => [String(row.source_label), String(row.segment_id)]));
   const productIds = new Map(products.map(row => [String(row.source_label), String(row.product_id)]));
-  await ensureDates(connection, objectId, selectedPeriods, config, env);
+  await ensureDates(connection, objectId, selectedDates, config, env);
   const [totalRows] = await connection.execute(
     `SELECT COUNT(*) AS total,SUM(parse_status='valid') AS valid_rows FROM dashboard_stg_position_row WHERE object_id=?`, [objectId],
   );
@@ -223,7 +256,7 @@ async function buildCandidateFacts(connection, objectId, selectedPeriods, progre
     );
     if (!rows.length) break;
     if (BigInt(rows[0].stg_position_id) <= BigInt(cursor)) throw new Error('Cursor staging tidak maju.');
-    const selectedRows = rows.filter(row => selectedPeriods.has(String(row.parsed_position_date).slice(0, 7)));
+    const selectedRows = rows.filter(row => selectedDates.has(String(row.parsed_position_date)));
     if (selectedRows.length) {
     await assertActualAdminTarget(connection, config, env);
     await inFactChunkTransaction(connection, async () => {
@@ -255,7 +288,7 @@ async function buildCandidateFacts(connection, objectId, selectedPeriods, progre
          (stg_position_id,master_source_object_id,office_id,office_version_id,mapping_status)
          VALUES ${placeholders(newMappings, 5)}`, newMappings.flat(),
       );
-      const sourceRows = rows.map(row => String(row.source_row_number));
+      const sourceRows = selectedRows.map(row => String(row.source_row_number));
       const [existingFacts] = await connection.execute(
         `SELECT ${FACT_COLUMNS.map(column => column === 'position_date' ? "DATE_FORMAT(position_date,'%Y-%m-%d') AS position_date" : column).join(',')}
          FROM dashboard_fact_position_daily
@@ -275,25 +308,77 @@ async function buildCandidateFacts(connection, objectId, selectedPeriods, progre
     progress?.({ phase: 'facts', processed, total });
   }
   if (processed !== total) throw new Error('Tidak semua baris staging diproses.');
-  for (const period of selectedPeriods) {
+  for (const date of selectedDates) {
     const [facts] = await connection.execute(
       `SELECT COUNT(*) AS total,SUM(parse_status<>'valid') AS invalid_rows
        FROM dashboard_fact_position_daily WHERE object_id=? AND position_date>=? AND position_date<?`,
-      [objectId, `${period}-01`, nextMonth(period)],
+      [objectId, date, nextDate(date)],
     );
     const [source] = await connection.execute(
       `SELECT COUNT(*) AS total FROM dashboard_stg_position_row
        WHERE object_id=? AND parsed_position_date>=? AND parsed_position_date<?`,
-      [objectId, `${period}-01`, nextMonth(period)],
+      [objectId, date, nextDate(date)],
     );
     if (Number(facts[0]?.total) !== Number(source[0]?.total) || Number(facts[0]?.invalid_rows)) {
-      throw new Error(`Rekonsiliasi fakta periode ${period} gagal.`);
+      throw new Error(`Rekonsiliasi fakta tanggal ${date} gagal.`);
     }
   }
   return { sourceRows: total, candidateRows: selectedProcessed, resolved, unresolved, masterObjectId: master.masterObjectId };
 }
 
-export async function commitPositionWorkbook({ filePath, preview, decisions, confirmation, actor, pool, config, progress, env = process.env }) {
+export async function publishPositionDates(connection, { changes, before, stagedBatchId, objectId, actor }) {
+  await connection.beginTransaction();
+  try {
+    for (const item of changes) {
+      const [rows] = await connection.execute(
+        `SELECT COUNT(*) AS total FROM dashboard_fact_position_daily
+         WHERE object_id=? AND position_date>=? AND position_date<?`,
+        [objectId, item.date, nextDate(item.date)],
+      );
+      if (Number(rows[0]?.total) !== item.sourceRows) throw new Error(`Fakta tanggal ${item.date} tidak lengkap.`);
+      const [current] = await connection.execute(
+        `SELECT batch_id,publication_version FROM dashboard_domain_publication
+         WHERE domain_key=? AND scope_key=? FOR UPDATE`, [ADMIN_POSITION_DOMAIN, item.date],
+      );
+      const prior = current[0]?.batch_id ?? null;
+      const expectedPrior = before.dates[item.date];
+      const baselineExists = Number(expectedPrior?.rows ?? 0) > 0;
+      if (baselineExists !== (item.action === 'replace')) throw new Error('Keputusan tanggal berubah sebelum publikasi.');
+      if (expectedPrior?.source === 'published-day'
+        ? (prior !== expectedPrior.batchId || Number(current[0]?.publication_version) !== expectedPrior.version)
+        : current.length !== 0) throw new Error('Publikasi tanggal berubah saat kandidat fakta dibangun.');
+      if (current.length) {
+        if (prior === stagedBatchId) continue;
+        const version = Number(current[0].publication_version) + 1;
+        await connection.execute(
+          `UPDATE dashboard_domain_publication SET batch_id=?,publication_version=?,published_at=CURRENT_TIMESTAMP(3)
+           WHERE domain_key=? AND scope_key=?`, [stagedBatchId, version, ADMIN_POSITION_DOMAIN, item.date],
+        );
+        await connection.execute(
+          `INSERT INTO dashboard_domain_publication_history
+           (domain_key,scope_key,previous_batch_id,new_batch_id,publication_version,action,actor,reason)
+           VALUES (?,?,?,?,?,'replace',?,?)`,
+          [ADMIN_POSITION_DOMAIN, item.date, prior, stagedBatchId, version, actor, 'Admin upload Excel; versi tanggal sebelumnya dipertahankan'],
+        );
+      } else {
+        await connection.execute(
+          `INSERT INTO dashboard_domain_publication (domain_key,scope_key,batch_id,publication_version,published_at)
+           VALUES (?,?,?,1,CURRENT_TIMESTAMP(3))`, [ADMIN_POSITION_DOMAIN, item.date, stagedBatchId],
+        );
+        await connection.execute(
+          `INSERT INTO dashboard_domain_publication_history
+           (domain_key,scope_key,previous_batch_id,new_batch_id,publication_version,action,actor,reason)
+           VALUES (?,?,?,?,1,?,?,?)`,
+          [ADMIN_POSITION_DOMAIN, item.date, expectedPrior?.batchId ?? null,
+            stagedBatchId, item.action, actor, 'Admin upload Excel; snapshot tanggal sebelumnya dipertahankan'],
+        );
+      }
+    }
+    await connection.commit();
+  } catch (error) { await connection.rollback(); throw error; }
+}
+
+export async function commitPositionWorkbook({ filePath, preview, decisions, confirmation, snapshotComplete, actor, pool, config, progress, env = process.env }) {
   assertAdminPositionTarget(config, env);
   if (await sha256File(filePath) !== preview.checksum) throw new Error('File berubah setelah preview. Unggah ulang.');
   const connection = await pool.getConnection();
@@ -304,18 +389,24 @@ export async function commitPositionWorkbook({ filePath, preview, decisions, con
     const [locks] = await connection.execute('SELECT GET_LOCK(?,30) AS acquired', ['dashboard-admin-position-publication']);
     locked = Number(locks[0]?.acquired) === 1;
     if (!locked) throw new Error('Proses upload Posisi Dana lain sedang berlangsung.');
-    const before = await currentPositionPeriods(connection);
-    const sourcePeriods = Object.fromEntries(Object.entries(preview.periods).map(([period, data]) => [period, data.rows]));
-    const selected = validatePeriodDecisions(sourcePeriods, before.periods, decisions, confirmation);
+    const before = await currentPositionDates(connection);
+    const sourceDates = Object.fromEntries(Object.entries(preview.dates).map(([date, data]) => [date, data.rows]));
+    const selected = validateDateDecisions(sourceDates, before.dates, decisions, confirmation, snapshotComplete);
     for (const item of selected) {
-      const previewExisting = preview.periods[item.period]?.existing ?? null;
-      const currentExisting = before.periods[item.period] ?? null;
+      const previewExisting = preview.dates[item.date]?.existing ?? null;
+      const currentExisting = before.dates[item.date] ?? null;
       if ((previewExisting?.rows ?? 0) !== (currentExisting?.rows ?? 0)
         || (previewExisting?.version ?? null) !== (currentExisting?.version ?? null)
-        || (previewExisting?.batchId ?? null) !== (currentExisting?.batchId ?? null)) {
-        throw new Error('Publikasi periode berubah sejak preview. Ulangi preview.');
+        || (previewExisting?.batchId ?? null) !== (currentExisting?.batchId ?? null)
+        || (previewExisting?.checksum ?? null) !== (currentExisting?.checksum ?? null)) {
+        throw new Error('Snapshot tanggal berubah sejak preview. Ulangi preview.');
       }
     }
+    const alreadyPublishedDates = selected.filter(item => before.dates[item.date]?.checksum === preview.checksum
+      && before.dates[item.date]?.rows === item.sourceRows).map(item => item.date);
+    const identical = new Set(alreadyPublishedDates);
+    const changes = selected.filter(item => !identical.has(item.date));
+    if (!changes.length) return { status: 'already_published', publishedDates: [], alreadyPublishedDates };
     progress?.({ phase: 'read-workbook', processed: 0 });
     workbook = await materializePositionWorkbook(filePath);
     if (workbook.checksum !== preview.checksum || workbook.rowCount !== preview.totalRows) throw new Error('Isi workbook berubah sejak preview.');
@@ -336,60 +427,13 @@ export async function commitPositionWorkbook({ filePath, preview, decisions, con
     );
     if (objects.length !== 1) throw new Error('Identitas object staging tidak tunggal.');
     const objectId = String(objects[0].object_id);
-    const facts = await buildCandidateFacts(connection, objectId, new Set(selected.map(item => item.period)), progress, config, env);
+    const facts = await buildCandidateFacts(connection, objectId, new Set(changes.map(item => item.date)), progress, config, env);
     await assertActualAdminTarget(connection, config, env);
-    await connection.beginTransaction();
-    try {
-      for (const item of selected) {
-        const [rows] = await connection.execute(
-          `SELECT COUNT(*) AS total FROM dashboard_fact_position_daily
-           WHERE object_id=? AND position_date>=? AND position_date<?`,
-          [objectId, `${item.period}-01`, nextMonth(item.period)],
-        );
-        if (Number(rows[0]?.total) !== item.sourceRows) throw new Error(`Fakta periode ${item.period} tidak lengkap.`);
-        const [current] = await connection.execute(
-          `SELECT batch_id,publication_version FROM dashboard_domain_publication
-           WHERE domain_key=? AND scope_key=? FOR UPDATE`, [ADMIN_POSITION_DOMAIN, item.period],
-        );
-        const prior = current[0]?.batch_id ?? null;
-        const baselineExists = Number(before.periods[item.period]?.rows ?? 0) > 0;
-        if (baselineExists !== (item.action === 'replace')) throw new Error('Keputusan periode berubah sebelum publikasi.');
-        const expectedPrior = before.periods[item.period];
-        if (expectedPrior?.source === 'published'
-          ? (prior !== expectedPrior.batchId || Number(current[0]?.publication_version) !== expectedPrior.version)
-          : current.length !== 0) throw new Error('Publikasi periode berubah saat kandidat fakta dibangun.');
-        if (current.length) {
-          if (prior === staged.batchId) continue;
-          const version = Number(current[0].publication_version) + 1;
-          await connection.execute(
-            `UPDATE dashboard_domain_publication SET batch_id=?,publication_version=?,published_at=CURRENT_TIMESTAMP(3)
-             WHERE domain_key=? AND scope_key=?`, [staged.batchId, version, ADMIN_POSITION_DOMAIN, item.period],
-          );
-          await connection.execute(
-            `INSERT INTO dashboard_domain_publication_history
-             (domain_key,scope_key,previous_batch_id,new_batch_id,publication_version,action,actor,reason)
-             VALUES (?,?,?,?,?,'replace',?,?)`,
-            [ADMIN_POSITION_DOMAIN, item.period, prior, staged.batchId, version, actor, 'Admin upload Excel; versi sebelumnya dipertahankan'],
-          );
-        } else {
-          await connection.execute(
-            `INSERT INTO dashboard_domain_publication (domain_key,scope_key,batch_id,publication_version,published_at)
-             VALUES (?,?,?,1,CURRENT_TIMESTAMP(3))`, [ADMIN_POSITION_DOMAIN, item.period, staged.batchId],
-          );
-          await connection.execute(
-            `INSERT INTO dashboard_domain_publication_history
-             (domain_key,scope_key,previous_batch_id,new_batch_id,publication_version,action,actor,reason)
-             VALUES (?,?,?,?,1,?,?,?)`,
-            [ADMIN_POSITION_DOMAIN, item.period, item.action === 'replace' ? before.baseBatchId : null,
-              staged.batchId, item.action, actor, 'Admin upload Excel; snapshot sebelumnya dipertahankan'],
-          );
-        }
-      }
-      await connection.commit();
-    } catch (error) { await connection.rollback(); throw error; }
+    await publishPositionDates(connection, { changes, before, stagedBatchId: staged.batchId, objectId, actor });
     invalidatePositionRowsCache();
     progress?.({ phase: 'completed', processed: facts.sourceRows, total: facts.sourceRows });
-    return { status: 'completed', batchId: staged.batchId, publishedPeriods: selected.map(item => item.period), facts };
+    return { status: 'completed', batchId: staged.batchId,
+      publishedDates: changes.map(item => item.date), alreadyPublishedDates, facts };
   } finally {
     if (workbook) await workbook.cleanup();
     if (locked) {

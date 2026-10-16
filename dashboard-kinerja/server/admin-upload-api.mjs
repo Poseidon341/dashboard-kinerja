@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { getDatabaseConfig, getDatabasePool } from './db.js';
 import {
   assertAdminPositionTarget, assertActualAdminTarget, commitPositionWorkbook,
-  currentPositionPeriods, previewPositionWorkbook, validatePeriodDecisions,
+  currentPositionDates, previewPositionWorkbook, validateDateDecisions,
 } from './admin-position-pipeline.mjs';
 
 const MAX_UPLOAD_BYTES = 350 * 1024 * 1024;
@@ -140,7 +140,7 @@ export function createAdminUploadHandler(dependencies = {}) {
     for (const [key, value] of failedLogins) if (value.until < now) failedLogins.delete(key);
   }
 
-  return async (request, response) => {
+  const handler = async (request, response) => {
     const url = new URL(request.url || '/', 'http://127.0.0.1');
     if (!url.pathname.startsWith('/api/admin/')) return false;
     clearExpired();
@@ -164,7 +164,7 @@ export function createAdminUploadHandler(dependencies = {}) {
         const csrf = randomBytes(32).toString('hex');
         sessions.set(id, { user: body.username, csrf, expiresAt: Date.now() + SESSION_MS });
         return send(response, 200, { status: 'ok', user: body.username, csrf }, {
-          'Set-Cookie': `funding_admin_session=${id}; HttpOnly; SameSite=Strict; ${env.DASHBOARD_RUNTIME_ENV === 'production' ? 'Secure; ' : ''}Path=/api/admin; Max-Age=${SESSION_MS / 1000}`,
+          'Set-Cookie': `funding_admin_session=${id}; HttpOnly; SameSite=Strict; ${env.DASHBOARD_RUNTIME_ENV === 'production' ? 'Secure; ' : ''}Path=/api; Max-Age=${SESSION_MS / 1000}`,
         });
       }
       const id = cookieId(request);
@@ -179,7 +179,7 @@ export function createAdminUploadHandler(dependencies = {}) {
       if (url.pathname === '/api/admin/logout' && request.method === 'POST') {
         sessions.delete(id);
         return send(response, 200, { status: 'ok' }, {
-          'Set-Cookie': `funding_admin_session=; HttpOnly; SameSite=Strict; ${env.DASHBOARD_RUNTIME_ENV === 'production' ? 'Secure; ' : ''}Path=/api/admin; Max-Age=0`,
+          'Set-Cookie': `funding_admin_session=; HttpOnly; SameSite=Strict; ${env.DASHBOARD_RUNTIME_ENV === 'production' ? 'Secure; ' : ''}Path=/api; Max-Age=0`,
         });
       }
       if (url.pathname === '/api/admin/history' && request.method === 'GET') {
@@ -194,7 +194,7 @@ export function createAdminUploadHandler(dependencies = {}) {
         });
         const local = [...jobs.values()].filter(job => job.user === session.user && job.status !== 'completed')
           .map(job => ({ reportType: 'position', at: new Date(job.updatedAt).toISOString(), status: job.status,
-            error: job.error ?? null, period: job.periods.join(', ') }));
+          error: job.error ?? null, period: job.dates.join(', ') }));
         return send(response, 200, { status: 'ok', records: [...local, ...history] });
       }
       if (url.pathname === '/api/admin/preview' && request.method === 'POST') {
@@ -217,20 +217,20 @@ export function createAdminUploadHandler(dependencies = {}) {
         if (entry.preview.invalidRows || Object.keys(entry.preview.validationErrors).length) {
           return send(response, 422, { status: 'error', error: 'source_validation_failed' });
         }
-        const current = await withDb(currentPositionPeriods);
-        const sourcePeriods = Object.fromEntries(Object.entries(entry.preview.periods).map(([period, value]) => [period, value.rows]));
-        const selected = validatePeriodDecisions(sourcePeriods, current.periods, body.decisions, body.confirmation);
+        const current = await withDb(currentPositionDates);
+        const sourceDates = Object.fromEntries(Object.entries(entry.preview.dates).map(([date, value]) => [date, value.rows]));
+        const selected = validateDateDecisions(sourceDates, current.dates, body.decisions, body.confirmation, body.snapshotComplete);
         entry.processing = true;
         const jobId = randomBytes(24).toString('hex');
         const job = { id: jobId, user: session.user, sessionId: id, status: 'processing',
           phase: 'queued', processed: 0, total: entry.preview.totalRows,
-          periods: selected.map(item => item.period), updatedAt: Date.now(), error: null, result: null };
+          dates: selected.map(item => item.date), updatedAt: Date.now(), error: null, result: null };
         jobs.set(jobId, job);
         setImmediate(async () => {
           try {
             const config = getConfig(); assertAdminPositionTarget(config, env);
             job.result = await commitWorkbook({ filePath: entry.upload.path, preview: entry.preview,
-              decisions: body.decisions, confirmation: body.confirmation, actor: session.user,
+              decisions: body.decisions, confirmation: body.confirmation, snapshotComplete: body.snapshotComplete, actor: session.user,
               pool: getPool(), config, env,
               progress: update => { Object.assign(job, update, { updatedAt: Date.now() }); },
             });
@@ -250,7 +250,7 @@ export function createAdminUploadHandler(dependencies = {}) {
         const job = jobs.get(url.pathname.slice('/api/admin/jobs/'.length));
         if (!job || job.sessionId !== id) return send(response, 404, { status: 'error', error: 'job_not_found' });
         return send(response, 200, { status: job.status, phase: job.phase,
-          processed: job.processed, total: job.total, periods: job.periods, error: job.error, result: job.result });
+          processed: job.processed, total: job.total, dates: job.dates, error: job.error, result: job.result });
       }
       return send(response, 404, { status: 'error', error: 'not_found' });
     } catch (error) {
@@ -264,4 +264,10 @@ export function createAdminUploadHandler(dependencies = {}) {
           : error?.name === 'AdminOriginError' ? 'admin_origin_not_allowed' : isSql ? 'database_unavailable' : 'admin_request_failed', message });
     }
   };
+  handler.authorizeDataRequest = (request) => {
+    const id = cookieId(request);
+    const session = id && sessions.get(id);
+    return Boolean(session && session.expiresAt > Date.now());
+  };
+  return handler;
 }

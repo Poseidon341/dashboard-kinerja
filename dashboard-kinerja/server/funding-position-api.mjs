@@ -162,7 +162,7 @@ async function readPublishedPositionScopes(connection) {
      JOIN dashboard_import_object o ON o.object_id=i.object_id
      WHERE p.domain_key='position_daily' AND p.batch_id IS NOT NULL ORDER BY p.scope_key`,
   );
-  if (rows.some(row => !/^\d{4}-(0[1-9]|1[0-2])$/.test(row.period))) {
+  if (rows.some(row => !/^\d{4}-(0[1-9]|1[0-2])(?:-(0[1-9]|[12]\d|3[01]))?$/.test(row.period))) {
     const error = new Error('Publikasi periode Posisi Dana tidak valid.');
     error.name = 'FundingApiDataError';
     throw error;
@@ -174,8 +174,15 @@ async function queryPositionGroups(connection, officeObjectId, objectId, period 
   const periodClause = period ? 'AND f.position_date>=? AND f.position_date<?' : '';
   const params = [officeObjectId, objectId];
   if (period) {
-    const [year, month] = period.split('-').map(Number);
-    params.push(`${period}-01`, `${month === 12 ? year + 1 : year}-${String(month === 12 ? 1 : month + 1).padStart(2, '0')}-01`);
+    if (period.length === 10) {
+      const next = new Date(`${period}T00:00:00.000Z`);
+      if (Number.isNaN(next.valueOf()) || next.toISOString().slice(0, 10) !== period) throw new Error('Tanggal publikasi tidak valid.');
+      next.setUTCDate(next.getUTCDate() + 1);
+      params.push(period, next.toISOString().slice(0, 10));
+    } else {
+      const [year, month] = period.split('-').map(Number);
+      params.push(`${period}-01`, `${month === 12 ? year + 1 : year}-${String(month === 12 ? 1 : month + 1).padStart(2, '0')}-01`);
+    }
   }
   const [rows] = await connection.execute(
     `SELECT DATE_FORMAT(f.position_date,'%Y-%m-%d') AS Posisi,
@@ -232,8 +239,7 @@ export async function readPositionRows(connection, snapshot) {
   const promise = (async () => {
   const baseRows = await queryPositionGroups(connection, officeObjects[0].object_id, snapshot.sourceObjectId);
   validatePositionRows(snapshot, baseRows);
-  const overrideMonths = new Set(published.map(row => row.period));
-  const records = baseRows.filter(row => !overrideMonths.has(row.Posisi.slice(0, 7)));
+  const scopedRows = [];
   for (const publication of published) {
     const override = await queryPositionGroups(connection, officeObjects[0].object_id, publication.object_id, publication.period);
     const sourceCount = override.reduce((sum, row) => sum + row.sourceRows, 0);
@@ -242,18 +248,23 @@ export async function readPositionRows(connection, snapshot) {
       error.name = 'FundingApiDataError';
       throw error;
     }
+    const scopeStart = publication.period.length === 10 ? publication.period : `${publication.period}-01`;
+    const scopeEnd = publication.period.length === 10
+      ? (() => { const next = new Date(`${publication.period}T00:00:00.000Z`); next.setUTCDate(next.getUTCDate() + 1); return next.toISOString().slice(0, 10); })()
+      : (() => { const [y,m]=publication.period.split('-').map(Number); return `${m===12?y+1:y}-${String(m===12?1:m+1).padStart(2,'0')}-01`; })();
     const [staging] = await connection.execute(
       `SELECT COUNT(*) AS total FROM dashboard_stg_position_row WHERE object_id=?
        AND parsed_position_date>=? AND parsed_position_date<?`,
-      [publication.object_id, `${publication.period}-01`, (() => { const [y,m]=publication.period.split('-').map(Number); return `${m===12?y+1:y}-${String(m===12?1:m+1).padStart(2,'0')}-01`; })()],
+      [publication.object_id, scopeStart, scopeEnd],
     );
     if (sourceCount !== Number(staging[0]?.total)) {
       const error = new Error(`Fakta periode ${publication.period} tidak lengkap.`);
       error.name = 'FundingApiDataError';
       throw error;
     }
-    records.push(...override);
+    scopedRows.push({ scopeKey: publication.period, rows: override });
   }
+  const records = overlayPositionScopes(baseRows, scopedRows);
   const totals = records.reduce((out, row) => {
     out.factRows += row.sourceRows; out.resolvedRows += row.resolvedRows; out.unresolvedRows += row.unresolvedRows;
     return out;
@@ -269,6 +280,16 @@ export async function readPositionRows(connection, snapshot) {
   } finally {
     if (positionRowsLoad?.promise === promise) positionRowsLoad = null;
   }
+}
+
+export function overlayPositionScopes(baseRows, scopedRows) {
+  const months = new Set(scopedRows.filter(item => item.scopeKey.length === 7).map(item => item.scopeKey));
+  const dates = new Set(scopedRows.filter(item => item.scopeKey.length === 10).map(item => item.scopeKey));
+  const records = baseRows.filter(row => !months.has(row.Posisi.slice(0, 7)) && !dates.has(row.Posisi));
+  for (const item of scopedRows) {
+    records.push(...(item.scopeKey.length === 7 ? item.rows.filter(row => !dates.has(row.Posisi)) : item.rows));
+  }
+  return records.sort((a, b) => a.Posisi.localeCompare(b.Posisi));
 }
 
 function sendJson(response, status, body, timing = {}) {

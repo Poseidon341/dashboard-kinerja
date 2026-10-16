@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { assertFundingApiTarget, buildSourceOfficeInventory, classifySourceOfficeType, clearPositionRowsCacheForTests, createFundingPositionHandler, readPositionSummary } from '../server/funding-position-api.mjs';
+import { assertFundingApiTarget, buildSourceOfficeInventory, classifySourceOfficeType, clearPositionRowsCacheForTests, createFundingPositionHandler, overlayPositionScopes, readPositionSummary } from '../server/funding-position-api.mjs';
 
 const columns = {
   dashboard_source_registry: ['source_id', 'source_key'],
@@ -28,7 +28,7 @@ function connectionFor({ sourceRows = 1_039_742, snapshotRows = 1_039_742, resol
       if (/FROM dashboard_domain_publication p/i.test(sql)) return [[{ object_id: 1 }]];
       if (/FROM dashboard_stg_position_row WHERE object_id/i.test(sql)) return [[{ total: 2 }]];
       if (/GROUP BY f\.position_date/i.test(sql)) return [[{
-        Posisi: sql.includes('f.position_date>=?') ? `${publishedPeriod}-02` : '2026-10-04', 'Segmentasi BPR': 'MIKRO', Produk: 'TABUNGAN', 'Nama Cabang': 'KC BANYUWANGI',
+        Posisi: sql.includes('f.position_date>=?') ? (publishedPeriod.length === 10 ? publishedPeriod : `${publishedPeriod}-02`) : '2026-10-04', 'Segmentasi BPR': 'MIKRO', Produk: 'TABUNGAN', 'Nama Cabang': 'KC BANYUWANGI',
         'Nama Uker': 'KC BANYUWANGI', 'Jumlah Rekening': '4', Saldo: '125.25', officeId: '11', mappingStatus: 'resolved',
         officeType: 'KC', officeName: 'KC Banyuwangi', areaName: 'Area Jember', sourceRows: sql.includes('f.position_date>=?') ? 2 : sourceRows,
         resolvedRows: sql.includes('f.position_date>=?') ? 2 : resolved, unresolvedRows: sql.includes('f.position_date>=?') ? 0 : unresolved, inconsistentRows: 0, invalidRows,
@@ -72,6 +72,22 @@ test('publikasi bulan baru menambah fakta tanpa menghilangkan snapshot lama', as
   assert.deepEqual(payload.records.map(row => row.Posisi), ['2026-10-04', '2026-11-02']);
 });
 
+test('endpoint membaca publikasi tanggal baru pada bulan yang sama tanpa menghapus tanggal lama', async () => {
+  clearPositionRowsCacheForTests();
+  const connection = connectionFor({ publishedPeriod: '2026-10-05' });
+  const handler = createFundingPositionHandler({
+    getConfig: () => ({ host: '127.0.0.1', port: 3308, database: 'dashboard_funding_test' }),
+    getPool: () => ({ getConnection: async () => connection }),
+  });
+  const response = responseCapture();
+  await handler(Object.assign(new EventEmitter(), { method: 'GET', url: '/api/funding/positions' }), response);
+  assert.equal(response.status, 200);
+  const payload = JSON.parse(response.body);
+  assert.equal(payload.recordCount, 1_039_744);
+  assert.deepEqual(payload.records.map(row => row.Posisi), ['2026-10-04', '2026-10-05']);
+  assert.ok(connection.statements.every(sql => /^\s*SELECT\b/i.test(sql)));
+});
+
 test('penggantian Oktober memilih hanya snapshot bulan baru dan tidak menghitung base dua kali', async () => {
   clearPositionRowsCacheForTests();
   const connection = connectionFor({ publishedPeriod: '2026-10' });
@@ -85,6 +101,32 @@ test('penggantian Oktober memilih hanya snapshot bulan baru dan tidak menghitung
   const payload = JSON.parse(response.body);
   assert.equal(payload.recordCount, 2);
   assert.deepEqual(payload.records.map(row => row.Posisi), ['2026-10-02']);
+});
+
+test('snapshot tanggal baru dan penggantian satu tanggal tidak menghapus tanggal lain', () => {
+  const base = [
+    { Posisi: '2026-10-03', Saldo: 30 },
+    { Posisi: '2026-10-04', Saldo: 40 },
+    { Posisi: '2026-12-01', Saldo: 120 },
+  ];
+  const active = overlayPositionScopes(base, [
+    { scopeKey: '2026-10-04', rows: [{ Posisi: '2026-10-04', Saldo: 41 }] },
+    { scopeKey: '2026-11-01', rows: [{ Posisi: '2026-11-01', Saldo: 11 }] },
+    { scopeKey: '2026-11-02', rows: [{ Posisi: '2026-11-02', Saldo: 12 }] },
+  ]);
+  assert.deepEqual(active.map(row => [row.Posisi, row.Saldo]), [
+    ['2026-10-03', 30], ['2026-10-04', 41], ['2026-11-01', 11],
+    ['2026-11-02', 12], ['2026-12-01', 120],
+  ]);
+  assert.deepEqual(base.map(row => row.Saldo), [30, 40, 120]);
+});
+
+test('publikasi harian mengungguli publikasi bulan lama tanpa saldo ganda', () => {
+  const active = overlayPositionScopes([{ Posisi: '2026-10-01', Saldo: 1 }], [
+    { scopeKey: '2026-10', rows: [{ Posisi: '2026-10-02', Saldo: 20 }, { Posisi: '2026-10-03', Saldo: 30 }] },
+    { scopeKey: '2026-10-02', rows: [{ Posisi: '2026-10-02', Saldo: 21 }] },
+  ]);
+  assert.deepEqual(active.map(row => [row.Posisi, row.Saldo]), [['2026-10-02', 21], ['2026-10-03', 30]]);
 });
 
 test('ringkasan menolak fakta yang belum lengkap atau unresolved yang hilang', async () => {
